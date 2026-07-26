@@ -4,8 +4,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { normalizeOllamaBaseUrl, streamOllamaChat } from "./ollama.js";
 
-export type LlmApiType = "openai-completions" | "openai-responses" | "anthropic-messages";
+export type LlmApiType = "openai-completions" | "openai-responses" | "anthropic-messages" | "ollama";
 export type LlmThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type LlmThinkingFormat =
   | "openai"
@@ -83,9 +84,9 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
     loadLocalEnvFile(env);
   }
   const rawBaseUrl = env.LLM_API_BASE_URL;
-  const apiKey = env.LLM_API_KEY;
-  const modelId = env.LLM_DEFAULT_MODEL;
   const apiType = parseLlmApiType(env.LLM_API_TYPE);
+  const apiKey = env.LLM_API_KEY || (apiType === "ollama" ? "ollama" : undefined);
+  const modelId = env.LLM_DEFAULT_MODEL;
   if (!rawBaseUrl) {
     throw new Error("Missing LLM_API_BASE_URL");
   }
@@ -109,7 +110,7 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
       baseUrl: env[`${prefix}BASE_URL`]
         ? normalizeLlmBaseUrl(env[`${prefix}BASE_URL`] as string, roleApiType)
         : undefined,
-      apiKey: env[`${prefix}API_KEY`] || undefined
+      apiKey: env[`${prefix}API_KEY`] || (roleApiType === "ollama" ? "ollama" : undefined)
     };
   }
   return {
@@ -197,11 +198,12 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
   for (const [provider, group] of providerGroups) {
     authStorage.setRuntimeApiKey(provider, group.apiKey);
     modelRegistry.registerProvider(provider, {
-      name: "Baizhi OpenAI-compatible Gateway",
+      name: group.apiType === "ollama" ? "Ollama" : "Baizhi OpenAI-compatible Gateway",
       baseUrl: group.baseUrl,
       apiKey: group.apiKey,
       api: group.apiType,
-      authHeader: group.apiType !== "anthropic-messages",
+      authHeader: group.apiType !== "anthropic-messages" && group.apiType !== "ollama",
+      ...(group.apiType === "ollama" ? { streamSimple: streamOllamaChat } : {}),
       models: group.models as never
     });
   }
@@ -272,6 +274,9 @@ function normalizeLlmBaseUrl(rawBaseUrl: string, apiType: LlmApiType): string {
   if (apiType === "anthropic-messages") {
     return normalizeAnthropicMessagesBaseUrl(rawBaseUrl);
   }
+  if (apiType === "ollama") {
+    return normalizeOllamaBaseUrl(rawBaseUrl);
+  }
   return normalizeOpenAIBaseUrl(rawBaseUrl, apiType);
 }
 
@@ -296,6 +301,9 @@ function parseLlmApiType(apiType: string | LlmApiType | undefined): LlmApiType {
     normalizedApiType === "messages"
   ) {
     return "anthropic-messages";
+  }
+  if (normalizedApiType === "ollama") {
+    return "ollama";
   }
   throw new Error(`Unsupported LLM_API_TYPE: ${apiType}`);
 }

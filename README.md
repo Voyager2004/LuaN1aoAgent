@@ -245,7 +245,7 @@ Each fresh CLI invocation creates an isolated session under `.agent-runtime/sess
 |---|---|---|
 | Operating system | macOS or Linux | Windows has not been validated as a v2 release target |
 | Node.js | 25+ | Must support the built-in `node:sqlite` runtime used by v2 |
-| LLM API | OpenAI-compatible | Chat Completions by default; Responses API is optional |
+| LLM API | OpenAI-compatible, Anthropic Messages, or native Ollama | Chat Completions by default; Responses API is optional |
 | Terminal | ANSI-compatible TTY | Required for the interactive Agent timeline |
 | Browser | Current Chromium, Firefox, or Safari | Used by the authenticated Web workbench |
 
@@ -274,7 +274,7 @@ LLM_API_KEY=your-api-key
 LLM_API_BASE_URL=https://api.openai.com/v1
 LLM_DEFAULT_MODEL=your-model-id
 
-# Optional: openai-completions, openai-responses, or anthropic-messages
+# Optional: openai-completions, openai-responses, anthropic-messages, or ollama
 LLM_API_TYPE=openai-completions
 ```
 
@@ -287,6 +287,14 @@ LLM_PLANNER_MODEL=your-planner-model
 LLM_PLANNER_API_TYPE=anthropic-messages
 LLM_PLANNER_BASE_URL=https://api.example.com
 LLM_PLANNER_API_KEY=your-planner-key
+```
+
+For a local Ollama server, use its native API type (the API key is optional):
+
+```ini
+LLM_API_TYPE=ollama
+LLM_API_BASE_URL=http://127.0.0.1:11434
+LLM_DEFAULT_MODEL=your-ollama-model
 ```
 
 v2 reads `.env` locally. The file is ignored by Git and must never be committed.

@@ -7,6 +7,7 @@ import {
   normalizeOpenAIBaseUrl,
   normalizeOpenAICompletionsBaseUrl
 } from "../src/llm-config.js";
+import { normalizeOllamaBaseUrl, streamOllamaChat } from "../src/ollama.js";
 
 test("normalizes full chat completions endpoint to OpenAI-compatible base URL", () => {
   assert.equal(
@@ -51,6 +52,82 @@ test("registers OpenAI Responses runtime when LLM_API_TYPE requests it", () => {
   assert.equal(config.apiType, "openai-responses");
   assert.equal(runtime.model.api, "openai-responses");
   assert.equal(runtime.model.baseUrl, "https://example.test/api/openai");
+});
+
+test("registers native Ollama without requiring an API key", () => {
+  assert.equal(
+    normalizeOllamaBaseUrl("http://localhost:11434/api/chat"),
+    "http://localhost:11434"
+  );
+  const config = loadLlmRuntimeConfig({
+    LLM_API_BASE_URL: "http://localhost:11434/api/chat",
+    LLM_DEFAULT_MODEL: "local-model",
+    LLM_API_TYPE: "ollama"
+  });
+  const runtime = createLlmRuntime(config);
+  assert.equal(config.apiKey, "ollama");
+  assert.equal(runtime.model.api, "ollama");
+  assert.equal(runtime.model.baseUrl, "http://localhost:11434");
+});
+
+test("adapts a native Ollama chat response into Pi events", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let requestUrl = "";
+  let requestBody: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requestUrl = input.toString();
+    requestBody = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({
+      message: {
+        thinking: "inspect the target",
+        content: "I will run a command.",
+        tool_calls: [{ function: { name: "bash", arguments: { command: "id" } } }]
+      },
+      done_reason: "tool_calls",
+      prompt_eval_count: 11,
+      eval_count: 7
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const runtime = createLlmRuntime(loadLlmRuntimeConfig({
+    LLM_API_BASE_URL: "http://localhost:11434",
+    LLM_DEFAULT_MODEL: "local-model",
+    LLM_API_TYPE: "ollama"
+  }));
+  const events = [];
+  for await (const event of streamOllamaChat(runtime.model, {
+    systemPrompt: "system instruction",
+    messages: [{ role: "user", content: "solve this", timestamp: Date.now() }]
+  }, { maxTokens: 99, reasoning: "low" })) {
+    events.push(event);
+  }
+
+  assert.equal(requestUrl, "http://localhost:11434/api/chat");
+  assert.deepEqual(requestBody, {
+    model: "local-model",
+    messages: [
+      { role: "system", content: "system instruction" },
+      { role: "user", content: "solve this" }
+    ],
+    stream: false,
+    think: true,
+    options: { num_predict: 99 }
+  });
+  assert.equal(events.at(-1)?.type, "done");
+  const done = events.at(-1);
+  assert.equal(done?.type === "done" && done.reason, "toolUse");
+  if (done?.type === "done") {
+    assert.equal(done.message.usage.input, 11);
+    assert.equal(done.message.usage.output, 7);
+    assert.deepEqual(done.message.content, [
+      { type: "thinking", thinking: "inspect the target" },
+      { type: "text", text: "I will run a command." },
+      { type: "toolCall", id: done.message.content[2]?.type === "toolCall" ? done.message.content[2].id : "", name: "bash", arguments: { command: "id" } }
+    ]);
+  }
 });
 
 test("registers an Anthropic Messages planner alongside OpenAI executor roles", () => {
