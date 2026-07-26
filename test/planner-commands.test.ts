@@ -25,6 +25,27 @@ test("defaults omitted apply_commands commands to an empty no-op list", () => {
   assert.deepEqual(decision.commands, []);
 });
 
+test("decodes a JSON-encoded command array and defaults omitted decision metadata", () => {
+  const decision = normalizePlannerDecision({
+    decision: "apply_commands",
+    commands: JSON.stringify([{
+      kind: "set_task_status",
+      taskId: "task:recon",
+      status: "partial"
+    }])
+  });
+
+  assert.equal(decision.reason, "Planner did not provide a reason");
+  assert.deepEqual(decision.basedOnRefs, []);
+  assert.deepEqual(decision.commands, [{
+    kind: "set_task_status",
+    taskId: "task:recon",
+    status: "partial",
+    basedOnRefs: [],
+    reason: undefined
+  }]);
+});
+
 test("accepts archived as the logical deletion status for old tasks", () => {
   const decision = normalizePlannerDecision({
     decision: "apply_commands",

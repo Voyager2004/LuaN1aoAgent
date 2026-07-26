@@ -149,6 +149,14 @@ const ProjectorGraphNodeSchema = Type.Union([
     ...ProjectorGraphNodeCommonProperties,
     graphKind: Type.Literal("operation"),
     type: OperationNodeTypeSchema
+  }, { additionalProperties: false }),
+  // Projectors occasionally repeat Task nodes from the visible graph.  The
+  // deterministic projection expander drops task-shaped proposals, so accepting
+  // them here avoids consuming a whole model turn on a recoverable schema error.
+  Type.Object({
+    ...ProjectorGraphNodeCommonProperties,
+    graphKind: Type.Literal("task"),
+    type: TaskNodeTypeSchema
   }, { additionalProperties: false })
 ]);
 
@@ -163,7 +171,9 @@ const GraphEdgeSchema = Type.Object({
 const ProjectorGraphEdgeSchema = Type.Object({
   from: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
   to: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
-  type: ProjectorGraphEdgeTypeSchema,
+  // Edges connected to task-shaped proposals are discarded by the projection
+  // expander.  Accepting their enum values keeps that sanitization deterministic.
+  type: GraphEdgeTypeSchema,
   properties: Type.Optional(Type.Object({}, { additionalProperties: GraphPropertyValueSchema })),
   evidenceRefs: Type.Optional(Type.Array(Type.String({ maxLength: 32 }), { maxItems: 8 }))
 }, { additionalProperties: false });
@@ -248,9 +258,15 @@ export function createPlannerSubmitTool(input: {
     description: "Submit the final Planner decision using commands discriminated by the required kind field, then terminate this Planner invocation.",
     parameters: Type.Object({
       decision: Type.Union([Type.Literal("apply_commands")]),
-      commands: Type.Optional(Type.Array(PlannerCommandSchema, { maxItems: 32 })),
-      reason: Type.String({ minLength: 1, maxLength: 4_000 }),
-      basedOnRefs: PlannerRefArraySchema
+      // Some OpenAI-compatible providers serialize a nested tool array as a
+      // JSON string.  normalizePlannerDecision decodes it before semantic
+      // validation, preserving the same command contract after recovery.
+      commands: Type.Optional(Type.Union([
+        Type.Array(PlannerCommandSchema, { maxItems: 32 }),
+        Type.String({ minLength: 2, maxLength: 48_000 })
+      ])),
+      reason: Type.Optional(Type.String({ minLength: 1, maxLength: 4_000 })),
+      basedOnRefs: Type.Optional(PlannerRefArraySchema)
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
       await input.validate?.(params);

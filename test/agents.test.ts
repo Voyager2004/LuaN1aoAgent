@@ -40,7 +40,7 @@ test("executor exposes bounded public research tools", () => {
   );
 });
 
-test("projector terminal tool uses a bounded strict draft schema", () => {
+test("projector terminal tool accepts bounded task-shaped drafts for deterministic sanitization", () => {
   const tool = createGraphDeltaSubmitTool();
   const schema = tool.parameters as unknown as {
     properties: {
@@ -77,7 +77,7 @@ test("projector terminal tool uses a bounded strict draft schema", () => {
   assert.equal(schema.properties.edges.maxItems, 20);
   assert.deepEqual(
     schema.properties.nodes.items?.anyOf?.map((branch) => branch.properties?.graphKind?.const),
-    ["reasoning", "operation"]
+    ["reasoning", "operation", "task"]
   );
   assert.ok(schema.properties.nodes.items?.anyOf?.every((branch) => branch.additionalProperties === false));
   assert.ok(schema.properties.nodes.items?.anyOf?.every((branch) => branch.properties?.id?.pattern === "^(existing|new):[1-9][0-9]*$"));
@@ -87,7 +87,7 @@ test("projector terminal tool uses a bounded strict draft schema", () => {
   assert.equal(schema.properties.edges.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(
     schema.properties.edges.items?.properties?.type?.anyOf?.some((branch) => branch.const === "depends_on"),
-    false
+    true
   );
   assert.equal(schema.properties.sourceEventIds, undefined);
   assert.equal(schema.additionalProperties, false);
@@ -98,34 +98,41 @@ test("planner terminal tool exposes discriminated command schemas", () => {
   const schema = tool.parameters as unknown as {
     properties: {
       commands: {
-        maxItems?: number;
-        items?: {
-          anyOf?: Array<{
-            additionalProperties?: boolean;
-            required?: string[];
-            properties?: {
-              kind?: { const?: string };
-              type?: unknown;
-              expectedVersion?: unknown;
-              tasks?: {
-                items?: {
-                  required?: string[];
-                  properties?: {
-                    id?: { pattern?: string };
-                    scopeRef?: { pattern?: string };
+        anyOf?: Array<{
+          type?: string;
+          maxItems?: number;
+          items?: {
+            anyOf?: Array<{
+              additionalProperties?: boolean;
+              required?: string[];
+              properties?: {
+                kind?: { const?: string };
+                type?: unknown;
+                expectedVersion?: unknown;
+                tasks?: {
+                  items?: {
+                    required?: string[];
+                    properties?: {
+                      id?: { pattern?: string };
+                      scopeRef?: { pattern?: string };
+                    };
                   };
                 };
               };
-            };
-          }>;
-        };
+            }>;
+          };
+        }>;
       };
+      reason?: unknown;
+      basedOnRefs?: unknown;
     };
+    required?: string[];
     additionalProperties?: boolean;
   };
-  const branches = schema.properties.commands.items?.anyOf ?? [];
+  const commandArray = schema.properties.commands.anyOf?.find((candidate) => candidate.type === "array");
+  const branches = commandArray?.items?.anyOf ?? [];
 
-  assert.equal(schema.properties.commands.maxItems, 32);
+  assert.equal(commandArray?.maxItems, 32);
   assert.deepEqual(
     branches.map((branch) => branch.properties?.kind?.const),
     ["create_tasks", "patch_task", "replace_dependencies", "set_task_status", "set_node_status"]
@@ -136,6 +143,8 @@ test("planner terminal tool exposes discriminated command schemas", () => {
   assert.ok(branches.every((branch) => branch.properties?.expectedVersion === undefined));
   assert.equal(branches[0]?.properties?.tasks?.items?.properties?.id?.pattern, "^task:.+");
   assert.equal(branches[0]?.properties?.tasks?.items?.properties?.scopeRef?.pattern, "^scope:.+");
+  assert.equal(schema.required?.includes("reason"), false);
+  assert.equal(schema.required?.includes("basedOnRefs"), false);
   assert.equal(schema.additionalProperties, false);
 });
 

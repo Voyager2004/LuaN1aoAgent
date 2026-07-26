@@ -212,6 +212,10 @@ test("Linux bubblewrap command mounts only runtime roots and keeps network avail
   assert.ok(command.includes("--bind"));
   assert.ok(command.includes("/tmp/runtime/sandboxes/run"));
   assert.ok(command.includes("/home/test/.agents/skills"));
+  assert.ok(command.some((value, index) => value === "--bind"
+    && command[index + 1] === "/tmp/runtime/sandboxes/run/tmp"
+    && command[index + 2] === "/tmp"));
+  assert.equal(command.includes("--tmpfs"), false);
   assert.ok(!command.includes("--unshare-net"));
   assert.ok(!command.some((value, index) => value === "--ro-bind" && command[index + 1] === "/"));
   assert.deepEqual(command.slice(-3), ["/bin/bash", "-c", "curl http://127.0.0.1:8080"]);

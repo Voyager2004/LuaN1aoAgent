@@ -18,15 +18,27 @@ export function normalizePlannerDecision(value: unknown): PlannerDecision {
   if (decision !== "apply_commands") {
     throw new PlannerProtocolError(`Unsupported planner decision: ${String(decision)}`);
   }
-  if (value.commands !== undefined && !Array.isArray(value.commands)) {
-    throw new PlannerProtocolError("apply_commands commands must be an array");
-  }
+  const commands = normalizePlannerCommands(value.commands);
   return {
     decision,
-    commands: (value.commands ?? []).map(normalizePlannerCommand),
+    commands: commands.map(normalizePlannerCommand),
     reason,
     basedOnRefs
   };
+}
+
+function normalizePlannerCommands(value: unknown): unknown[] {
+  if (value === undefined) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const decoded = JSON.parse(value) as unknown;
+      if (Array.isArray(decoded)) return decoded;
+    } catch {
+      // Fall through to the protocol error below.
+    }
+  }
+  throw new PlannerProtocolError("apply_commands commands must be an array or a JSON-encoded array");
 }
 
 function normalizePlannerCommand(value: unknown): PlannerCommand {
