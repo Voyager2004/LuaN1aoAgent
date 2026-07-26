@@ -7,7 +7,7 @@ import {
   normalizeOpenAIBaseUrl,
   normalizeOpenAICompletionsBaseUrl
 } from "../src/llm-config.js";
-import { normalizeOllamaBaseUrl, streamOllamaChat } from "../src/ollama.js";
+import { normalizeOllamaBaseUrl, ollamaNumCtxOption, streamOllamaChat } from "../src/ollama.js";
 
 test("normalizes full chat completions endpoint to OpenAI-compatible base URL", () => {
   assert.equal(
@@ -68,6 +68,13 @@ test("registers native Ollama without requiring an API key", () => {
   assert.equal(config.apiKey, "ollama");
   assert.equal(runtime.model.api, "ollama");
   assert.equal(runtime.model.baseUrl, "http://localhost:11434");
+});
+
+test("validates an optional bounded Ollama context override", () => {
+  assert.deepEqual(ollamaNumCtxOption(undefined), {});
+  assert.deepEqual(ollamaNumCtxOption("32768"), { num_ctx: 32768 });
+  assert.throws(() => ollamaNumCtxOption("0"), /positive integer/);
+  assert.throws(() => ollamaNumCtxOption("32k"), /positive integer/);
 });
 
 test("adapts a native Ollama chat response into Pi events", async (t) => {

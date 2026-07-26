@@ -78,7 +78,10 @@ export function streamOllamaChat(
         tools: context.tools?.map(toOllamaTool),
         stream: true,
         think: Boolean(model.reasoning && options?.reasoning),
-        options: { num_predict: options?.maxTokens ?? model.maxTokens }
+        options: {
+          num_predict: options?.maxTokens ?? model.maxTokens,
+          ...ollamaNumCtxOption(process.env.LLM_OLLAMA_NUM_CTX)
+        }
       };
       const payload = await options?.onPayload?.(request, model) ?? request;
       const apiKey = options?.apiKey?.trim();
@@ -147,6 +150,23 @@ export function streamOllamaChat(
 
 export function normalizeOllamaBaseUrl(rawBaseUrl: string): string {
   return rawBaseUrl.replace(/\/+$/, "").replace(/\/api\/chat$/i, "");
+}
+
+/**
+ * Ollama otherwise chooses its server-wide default context length, which may
+ * be much larger than an agent run needs. Keeping this opt-in avoids changing
+ * existing deployments while allowing a bounded local context to be supplied.
+ */
+export function ollamaNumCtxOption(rawValue: string | undefined): { num_ctx?: number } {
+  const value = rawValue?.trim();
+  if (!value) {
+    return {};
+  }
+  const numCtx = Number(value);
+  if (!Number.isSafeInteger(numCtx) || numCtx <= 0) {
+    throw new Error("LLM_OLLAMA_NUM_CTX must be a positive integer");
+  }
+  return { num_ctx: numCtx };
 }
 
 function toOllamaMessages(context: Context): OllamaMessage[] {
