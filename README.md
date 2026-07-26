@@ -274,8 +274,19 @@ LLM_API_KEY=your-api-key
 LLM_API_BASE_URL=https://api.openai.com/v1
 LLM_DEFAULT_MODEL=your-model-id
 
-# Optional: openai-completions or openai-responses
+# Optional: openai-completions, openai-responses, or anthropic-messages
 LLM_API_TYPE=openai-completions
+```
+
+Each role may override the model, endpoint, key, and protocol. This permits a
+planner on an Anthropic Messages-compatible API while executor roles stay on an
+OpenAI-compatible endpoint:
+
+```ini
+LLM_PLANNER_MODEL=your-planner-model
+LLM_PLANNER_API_TYPE=anthropic-messages
+LLM_PLANNER_BASE_URL=https://api.example.com
+LLM_PLANNER_API_KEY=your-planner-key
 ```
 
 v2 reads `.env` locally. The file is ignored by Git and must never be committed.

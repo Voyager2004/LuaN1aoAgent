@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createLlmRuntime,
   loadLlmRuntimeConfig,
+  normalizeAnthropicMessagesBaseUrl,
   normalizeOpenAIBaseUrl,
   normalizeOpenAICompletionsBaseUrl
 } from "../src/llm-config.js";
@@ -52,6 +53,31 @@ test("registers OpenAI Responses runtime when LLM_API_TYPE requests it", () => {
   assert.equal(runtime.model.baseUrl, "https://example.test/api/openai");
 });
 
+test("registers an Anthropic Messages planner alongside OpenAI executor roles", () => {
+  assert.equal(
+    normalizeAnthropicMessagesBaseUrl("https://planner.example.test/v1/messages"),
+    "https://planner.example.test"
+  );
+  const config = loadLlmRuntimeConfig({
+    LLM_API_BASE_URL: "https://executor.example.test/v1",
+    LLM_API_KEY: "executor-key",
+    LLM_DEFAULT_MODEL: "qwen-executor",
+    LLM_PLANNER_API_TYPE: "anthropic-messages",
+    LLM_PLANNER_BASE_URL: "https://planner.example.test/v1",
+    LLM_PLANNER_API_KEY: "planner-key",
+    LLM_PLANNER_MODEL: "minimax-m2.5"
+  });
+  const runtime = createLlmRuntime(config);
+  assert.equal(config.roles.planner.apiType, "anthropic-messages");
+  assert.equal(runtime.models.planner.api, "anthropic-messages");
+  assert.equal(runtime.models.planner.baseUrl, "https://planner.example.test");
+  assert.equal(runtime.models.planner.provider, "baizhi-openai-planner");
+  assert.equal(runtime.models.executor.api, "openai-completions");
+  assert.equal(runtime.models.executor.baseUrl, "https://executor.example.test/v1");
+  assert.equal(runtime.metadata.models.planner.apiType, "anthropic-messages");
+  assert.equal("planner-key" in runtime.metadata.models.planner, false);
+});
+
 test("defaults to Chat Completions when LLM_API_TYPE is omitted", () => {
   const config = loadLlmRuntimeConfig({
     LLM_API_BASE_URL: "https://example.test/api/openai/responses",
@@ -73,6 +99,7 @@ test("defaults all roles to the shared model with a 32k completion budget", () =
     assert.equal(config.roles[role].modelId, "glm-5.2");
     assert.equal(config.roles[role].maxTokens, 32_768);
     assert.equal(config.roles[role].thinkingLevel, "off");
+    assert.equal(config.roles[role].apiType, "openai-completions");
   }
   const runtime = createLlmRuntime(config);
   for (const role of ["planner", "executor", "supervisor", "projector"] as const) {
@@ -153,4 +180,10 @@ test("rejects unsupported thinking level and format values", () => {
     LLM_DEFAULT_MODEL: "glm-5.2",
     LLM_THINKING_FORMAT: "xml"
   }), /Unsupported LLM_THINKING_FORMAT/);
+  assert.throws(() => loadLlmRuntimeConfig({
+    LLM_API_BASE_URL: "https://example.test/api/openai",
+    LLM_API_KEY: "test-key",
+    LLM_DEFAULT_MODEL: "glm-5.2",
+    LLM_PLANNER_API_TYPE: "unknown-protocol"
+  }), /Unsupported LLM_API_TYPE/);
 });

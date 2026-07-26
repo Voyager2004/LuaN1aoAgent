@@ -5,7 +5,7 @@ import {
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type LlmApiType = "openai-completions" | "openai-responses";
+export type LlmApiType = "openai-completions" | "openai-responses" | "anthropic-messages";
 export type LlmThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type LlmThinkingFormat =
   | "openai"
@@ -24,6 +24,7 @@ export type LlmRoleConfig = {
   modelId: string;
   maxTokens: number;
   thinkingLevel: LlmThinkingLevel;
+  apiType: LlmApiType;
   baseUrl?: string;
   apiKey?: string;
 };
@@ -62,6 +63,7 @@ export type LlmRuntime = {
       provider: string;
       modelId: string;
       baseUrl: string;
+      apiType: LlmApiType;
       maxTokens: number;
       thinkingLevel: LlmThinkingLevel;
     }>;
@@ -83,7 +85,7 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
   const rawBaseUrl = env.LLM_API_BASE_URL;
   const apiKey = env.LLM_API_KEY;
   const modelId = env.LLM_DEFAULT_MODEL;
-  const apiType = parseOpenAIApiType(env.LLM_API_TYPE);
+  const apiType = parseLlmApiType(env.LLM_API_TYPE);
   if (!rawBaseUrl) {
     throw new Error("Missing LLM_API_BASE_URL");
   }
@@ -98,12 +100,14 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
   const roles = {} as Record<LlmAgentRole, LlmRoleConfig>;
   for (const role of AGENT_ROLES) {
     const prefix = `LLM_${role.toUpperCase()}_`;
+    const roleApiType = parseLlmApiType(env[`${prefix}API_TYPE`] || apiType);
     roles[role] = {
       modelId: env[`${prefix}MODEL`] || modelId,
       maxTokens: positiveIntegerValue(env[`${prefix}MAX_TOKENS`], defaultMaxTokens),
       thinkingLevel: parseThinkingLevel(env[`${prefix}THINKING`], defaultThinkingLevel),
+      apiType: roleApiType,
       baseUrl: env[`${prefix}BASE_URL`]
-        ? normalizeOpenAIBaseUrl(env[`${prefix}BASE_URL`] as string, apiType)
+        ? normalizeLlmBaseUrl(env[`${prefix}BASE_URL`] as string, roleApiType)
         : undefined,
       apiKey: env[`${prefix}API_KEY`] || undefined
     };
@@ -111,7 +115,7 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
   return {
     provider: PROVIDER_NAME,
     modelId,
-    baseUrl: normalizeOpenAIBaseUrl(rawBaseUrl, apiType),
+    baseUrl: normalizeLlmBaseUrl(rawBaseUrl, apiType),
     apiKey,
     apiType,
     defaultMaxTokens,
@@ -134,19 +138,25 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
   // with their own base URL / API key get a per-role provider registration.
   type RoleAssignment = { provider: string; baseUrl: string; registeredId: string };
   const roleAssignments = new Map<LlmAgentRole, RoleAssignment>();
-  const providerGroups = new Map<string, { baseUrl: string; apiKey: string; models: Array<Record<string, unknown>> }>();
+  const providerGroups = new Map<string, {
+    baseUrl: string;
+    apiKey: string;
+    apiType: LlmApiType;
+    models: Array<Record<string, unknown>>;
+  }>();
   for (const role of AGENT_ROLES) {
     const roleCfg = config.roles[role];
     const baseUrl = roleCfg.baseUrl ?? config.baseUrl;
     const apiKey = roleCfg.apiKey ?? config.apiKey;
-    const groupKey = `${baseUrl}\n${apiKey}`;
-    let provider = groupKey === `${config.baseUrl}\n${config.apiKey}` ? config.provider : undefined;
+    const apiType = roleCfg.apiType;
+    const groupKey = `${baseUrl}\n${apiKey}\n${apiType}`;
+    let provider = groupKey === `${config.baseUrl}\n${config.apiKey}\n${config.apiType}` ? config.provider : undefined;
     if (provider && !providerGroups.has(provider)) {
-      providerGroups.set(provider, { baseUrl, apiKey, models: [] });
+      providerGroups.set(provider, { baseUrl, apiKey, apiType, models: [] });
     }
     if (!provider) {
       for (const [name, group] of providerGroups) {
-        if (group.baseUrl === baseUrl && group.apiKey === apiKey) {
+        if (group.baseUrl === baseUrl && group.apiKey === apiKey && group.apiType === apiType) {
           provider = name;
           break;
         }
@@ -154,7 +164,7 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
     }
     if (!provider) {
       provider = `${config.provider}-${role}`;
-      providerGroups.set(provider, { baseUrl, apiKey, models: [] });
+      providerGroups.set(provider, { baseUrl, apiKey, apiType, models: [] });
     }
     const group = providerGroups.get(provider)!;
     const existing = group.models.find((model) => model.name === roleCfg.modelId
@@ -170,7 +180,7 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
     group.models.push({
       id: registeredId,
       name: roleCfg.modelId,
-      api: config.apiType,
+      api: apiType,
       reasoning: true,
       input: ["text"],
       contextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -190,8 +200,8 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
       name: "Baizhi OpenAI-compatible Gateway",
       baseUrl: group.baseUrl,
       apiKey: group.apiKey,
-      api: config.apiType,
-      authHeader: true,
+      api: group.apiType,
+      authHeader: group.apiType !== "anthropic-messages",
       models: group.models as never
     });
   }
@@ -214,6 +224,7 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
       provider: assignment.provider,
       modelId: config.roles[role].modelId,
       baseUrl: assignment.baseUrl,
+      apiType: config.roles[role].apiType,
       maxTokens: config.roles[role].maxTokens,
       thinkingLevel: config.roles[role].thinkingLevel
     };
@@ -250,7 +261,21 @@ export function normalizeOpenAIBaseUrl(
   return trimmedBaseUrl.replace(endpointSuffix, "");
 }
 
-function parseOpenAIApiType(apiType: string | undefined): "openai-completions" | "openai-responses" {
+export function normalizeAnthropicMessagesBaseUrl(rawBaseUrl: string): string {
+  return rawBaseUrl
+    .replace(/\/+$/, "")
+    .replace(/\/v1\/messages$/i, "")
+    .replace(/\/v1$/i, "");
+}
+
+function normalizeLlmBaseUrl(rawBaseUrl: string, apiType: LlmApiType): string {
+  if (apiType === "anthropic-messages") {
+    return normalizeAnthropicMessagesBaseUrl(rawBaseUrl);
+  }
+  return normalizeOpenAIBaseUrl(rawBaseUrl, apiType);
+}
+
+function parseLlmApiType(apiType: string | LlmApiType | undefined): LlmApiType {
   if (!apiType) {
     return "openai-completions";
   }
@@ -264,6 +289,13 @@ function parseOpenAIApiType(apiType: string | undefined): "openai-completions" |
     normalizedApiType === "completions"
   ) {
     return "openai-completions";
+  }
+  if (
+    normalizedApiType === "anthropic-messages" ||
+    normalizedApiType === "anthropic" ||
+    normalizedApiType === "messages"
+  ) {
+    return "anthropic-messages";
   }
   throw new Error(`Unsupported LLM_API_TYPE: ${apiType}`);
 }
