@@ -32,14 +32,17 @@ type OllamaResponse = {
   done_reason?: string;
   prompt_eval_count?: number;
   eval_count?: number;
+  done?: boolean;
   error?: string;
 };
 
 type OllamaToolCall = NonNullable<NonNullable<OllamaResponse["message"]>["tool_calls"]>[number];
 
 /**
- * Calls Ollama's native /api/chat endpoint and adapts its completed response
- * to Pi's standard event stream.  Ollama has no API-key requirement by
+ * Calls Ollama's native /api/chat endpoint and adapts its NDJSON response
+ * to Pi's standard event stream. Forwarding token deltas is important: Pi
+ * uses them as an idle-progress signal while a local model is generating.
+ * Ollama has no API-key requirement by
  * default, but callers may still use a protected reverse proxy.
  */
 export function streamOllamaChat(
@@ -73,7 +76,7 @@ export function streamOllamaChat(
         model: model.id,
         messages: toOllamaMessages(context),
         tools: context.tools?.map(toOllamaTool),
-        stream: false,
+        stream: true,
         think: Boolean(model.reasoning && options?.reasoning),
         options: { num_predict: options?.maxTokens ?? model.maxTokens }
       };
@@ -92,22 +95,39 @@ export function streamOllamaChat(
         status: response.status,
         headers: Object.fromEntries(response.headers.entries())
       }, model);
-      const body = await parseOllamaResponse(response);
-      if (!response.ok || body.error) {
-        throw new Error(body.error || `Ollama returned HTTP ${response.status}`);
+      const deltaState = { thinkingIndex: undefined as number | undefined, textIndex: undefined as number | undefined };
+      let completed: OllamaResponse | undefined;
+      let responseError: string | undefined;
+      let toolCalls: OllamaToolCall[] | undefined;
+      await readOllamaResponses(response, (chunk) => {
+        if (chunk.error) {
+          responseError = chunk.error;
+          return;
+        }
+        appendThinkingDelta(stream, output, deltaState, chunk.message?.thinking);
+        appendTextDelta(stream, output, deltaState, chunk.message?.content);
+        if (chunk.message?.tool_calls?.length) {
+          toolCalls = chunk.message.tool_calls;
+        }
+        if (chunk.done) {
+          completed = chunk;
+        }
+      });
+      if (!response.ok || responseError) {
+        throw new Error(responseError || `Ollama returned HTTP ${response.status}`);
       }
-      if (!body.message) {
-        throw new Error("Ollama response did not include a message");
+      if (!completed) {
+        throw new Error("Ollama stream ended before its final response");
       }
 
-      appendThinking(stream, output, body.message.thinking);
-      appendText(stream, output, body.message.content);
-      appendToolCalls(stream, output, body.message.tool_calls);
-      output.usage.input = body.prompt_eval_count ?? 0;
-      output.usage.output = body.eval_count ?? 0;
+      finishTextDelta(stream, output, deltaState);
+      finishThinkingDelta(stream, output, deltaState);
+      appendToolCalls(stream, output, toolCalls);
+      output.usage.input = completed.prompt_eval_count ?? 0;
+      output.usage.output = completed.eval_count ?? 0;
       output.usage.totalTokens = output.usage.input + output.usage.output;
       calculateCost(model, output.usage);
-      output.stopReason = ollamaStopReason(body.done_reason, Boolean(body.message.tool_calls?.length));
+      output.stopReason = ollamaStopReason(completed.done_reason, Boolean(toolCalls?.length));
       stream.push({
         type: "done",
         reason: output.stopReason as Extract<StopReason, "stop" | "length" | "toolUse">,
@@ -190,44 +210,100 @@ function toOllamaTool(tool: Tool): Record<string, unknown> {
   };
 }
 
-async function parseOllamaResponse(response: Response): Promise<OllamaResponse> {
-  const text = await response.text();
-  if (!text) {
-    return {};
+async function readOllamaResponses(
+  response: Response,
+  onResponse: (chunk: OllamaResponse) => void
+): Promise<void> {
+  if (!response.body) {
+    throw new Error("Ollama response did not include a body");
   }
-  try {
-    return JSON.parse(text) as OllamaResponse;
-  } catch {
-    throw new Error(`Ollama returned invalid JSON: ${text.slice(0, 500)}`);
+  const decoder = new TextDecoder();
+  let buffered = "";
+  const consumeLine = (line: string): void => {
+    const value = line.trim();
+    if (!value) {
+      return;
+    }
+    try {
+      onResponse(JSON.parse(value) as OllamaResponse);
+    } catch {
+      throw new Error(`Ollama returned invalid JSON: ${value.slice(0, 500)}`);
+    }
+  };
+  for await (const bytes of response.body) {
+    buffered += decoder.decode(bytes, { stream: true });
+    const lines = buffered.split(/\r?\n/);
+    buffered = lines.pop() ?? "";
+    for (const line of lines) {
+      consumeLine(line);
+    }
   }
+  buffered += decoder.decode();
+  consumeLine(buffered);
 }
 
-function appendThinking(
+type DeltaState = { thinkingIndex: number | undefined; textIndex: number | undefined };
+
+function appendThinkingDelta(
   stream: AssistantMessageEventStream,
   output: AssistantMessage,
+  state: DeltaState,
   thinking: string | undefined
 ): void {
   if (!thinking) {
     return;
   }
-  const contentIndex = output.content.push({ type: "thinking", thinking }) - 1;
-  stream.push({ type: "thinking_start", contentIndex, partial: output });
-  stream.push({ type: "thinking_delta", contentIndex, delta: thinking, partial: output });
-  stream.push({ type: "thinking_end", contentIndex, content: thinking, partial: output });
+  if (state.thinkingIndex === undefined) {
+    state.thinkingIndex = output.content.push({ type: "thinking", thinking: "" }) - 1;
+    stream.push({ type: "thinking_start", contentIndex: state.thinkingIndex, partial: output });
+  }
+  const block = output.content[state.thinkingIndex];
+  if (block?.type !== "thinking") {
+    throw new Error("Ollama thinking stream content index is invalid");
+  }
+  block.thinking += thinking;
+  stream.push({ type: "thinking_delta", contentIndex: state.thinkingIndex, delta: thinking, partial: output });
 }
 
-function appendText(
+function appendTextDelta(
   stream: AssistantMessageEventStream,
   output: AssistantMessage,
+  state: DeltaState,
   text: string | undefined
 ): void {
   if (!text) {
     return;
   }
-  const contentIndex = output.content.push({ type: "text", text }) - 1;
-  stream.push({ type: "text_start", contentIndex, partial: output });
-  stream.push({ type: "text_delta", contentIndex, delta: text, partial: output });
-  stream.push({ type: "text_end", contentIndex, content: text, partial: output });
+  if (state.textIndex === undefined) {
+    state.textIndex = output.content.push({ type: "text", text: "" }) - 1;
+    stream.push({ type: "text_start", contentIndex: state.textIndex, partial: output });
+  }
+  const block = output.content[state.textIndex];
+  if (block?.type !== "text") {
+    throw new Error("Ollama text stream content index is invalid");
+  }
+  block.text += text;
+  stream.push({ type: "text_delta", contentIndex: state.textIndex, delta: text, partial: output });
+}
+
+function finishThinkingDelta(stream: AssistantMessageEventStream, output: AssistantMessage, state: DeltaState): void {
+  if (state.thinkingIndex === undefined) {
+    return;
+  }
+  const block = output.content[state.thinkingIndex];
+  if (block?.type === "thinking") {
+    stream.push({ type: "thinking_end", contentIndex: state.thinkingIndex, content: block.thinking, partial: output });
+  }
+}
+
+function finishTextDelta(stream: AssistantMessageEventStream, output: AssistantMessage, state: DeltaState): void {
+  if (state.textIndex === undefined) {
+    return;
+  }
+  const block = output.content[state.textIndex];
+  if (block?.type === "text") {
+    stream.push({ type: "text_end", contentIndex: state.textIndex, content: block.text, partial: output });
+  }
 }
 
 function appendToolCalls(

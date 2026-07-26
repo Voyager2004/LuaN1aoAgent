@@ -77,16 +77,17 @@ test("adapts a native Ollama chat response into Pi events", async (t) => {
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     requestUrl = input.toString();
     requestBody = JSON.parse(String(init?.body));
-    return new Response(JSON.stringify({
-      message: {
-        thinking: "inspect the target",
-        content: "I will run a command.",
-        tool_calls: [{ function: { name: "bash", arguments: { command: "id" } } }]
-      },
-      done_reason: "tool_calls",
-      prompt_eval_count: 11,
-      eval_count: 7
-    }), { status: 200, headers: { "content-type": "application/json" } });
+    return new Response([
+      JSON.stringify({ message: { thinking: "inspect the target" }, done: false }),
+      JSON.stringify({ message: { content: "I will run a command." }, done: false }),
+      JSON.stringify({
+        message: { tool_calls: [{ function: { name: "bash", arguments: { command: "id" } } }] },
+        done: true,
+        done_reason: "tool_calls",
+        prompt_eval_count: 11,
+        eval_count: 7
+      })
+    ].join("\n") + "\n", { status: 200, headers: { "content-type": "application/x-ndjson" } });
   }) as typeof fetch;
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -112,11 +113,13 @@ test("adapts a native Ollama chat response into Pi events", async (t) => {
       { role: "system", content: "system instruction" },
       { role: "user", content: "solve this" }
     ],
-    stream: false,
+    stream: true,
     think: true,
     options: { num_predict: 99 }
   });
   assert.equal(events.at(-1)?.type, "done");
+  assert.equal(events.some((event) => event.type === "thinking_delta"), true);
+  assert.equal(events.some((event) => event.type === "text_delta"), true);
   const done = events.at(-1);
   assert.equal(done?.type === "done" && done.reason, "toolUse");
   if (done?.type === "done") {
