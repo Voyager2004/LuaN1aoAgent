@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.80.3",
-    "@earendil-works/pi-coding-agent": "latest",
+    "@earendil-works/pi-coding-agent": "0.80.3",
     "@earendil-works/pi-tui": "0.80.3",
     "@mozilla/readability": "^0.6.0",
     "@types/dompurify": "^3.0.5",
