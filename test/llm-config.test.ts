@@ -105,8 +105,9 @@ test("adapts a native Ollama chat response into Pi events", async (t) => {
     LLM_DEFAULT_MODEL: "local-model",
     LLM_API_TYPE: "ollama"
   }));
+  const roleVariant = { ...runtime.model, id: "local-model#projector" };
   const events = [];
-  for await (const event of streamOllamaChat(runtime.model, {
+  for await (const event of streamOllamaChat(roleVariant, {
     systemPrompt: "system instruction",
     messages: [{ role: "user", content: "solve this", timestamp: Date.now() }]
   }, { maxTokens: 99, reasoning: "low" })) {
@@ -114,6 +115,7 @@ test("adapts a native Ollama chat response into Pi events", async (t) => {
   }
 
   assert.equal(requestUrl, "http://localhost:11434/api/chat");
+  // `id` selects an internal role variant; Ollama must receive the model name.
   assert.deepEqual(requestBody, {
     model: "local-model",
     messages: [

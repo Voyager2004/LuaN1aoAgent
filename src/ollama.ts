@@ -51,6 +51,10 @@ export function streamOllamaChat(
   options?: SimpleStreamOptions
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
+  // ModelRegistry may give same upstream model variants distinct internal ids
+  // (for example `qwen#projector`) when their completion budgets differ.
+  // Ollama only accepts the registered upstream name, never that local id.
+  const upstreamModelName = model.name?.trim() || model.id;
   const output: AssistantMessage = {
     role: "assistant",
     content: [],
@@ -73,7 +77,7 @@ export function streamOllamaChat(
     try {
       stream.push({ type: "start", partial: output });
       const request = {
-        model: model.id,
+        model: upstreamModelName,
         messages: toOllamaMessages(context),
         tools: context.tools?.map(toOllamaTool),
         stream: true,
