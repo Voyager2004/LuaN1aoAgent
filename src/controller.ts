@@ -120,6 +120,10 @@ const PLANNER_FRESH_SESSION_BACKOFF_MS = positiveIntegerEnv(
   "PLANNER_FRESH_SESSION_BACKOFF_MS",
   positiveIntegerEnv("PLANNER_PROVIDER_RETRY_BACKOFF_MS", 250)
 );
+const PLANNER_FRESH_SESSION_BACKOFF_JITTER_MS = positiveIntegerEnv(
+  "PLANNER_FRESH_SESSION_BACKOFF_JITTER_MS",
+  250
+);
 const PLANNER_DEFER_BACKOFF_MAX_MS = 5_000;
 const PLANNER_MAX_DEFERRED_FAILURES = positiveIntegerEnv("PLANNER_MAX_DEFERRED_FAILURES", 12);
 const MISSING_SUBMIT_RETRY_FEEDBACK = "上一次 Planner 调用未产生 planner_submit（输出在达到 max_completion_tokens 上限时被截断）。请直接调用 planner_submit 提交当前最佳决策：先发起工具调用，参数保持简洁（commands 内只保留必要字段），不要在正文输出推理过程。";
@@ -1727,6 +1731,7 @@ export class SecurityAgentController {
           || attempt >= PLANNER_FRESH_SESSION_ATTEMPTS) {
           throw error;
         }
+        retryDelayMs = plannerRetryDelayMs(attempt);
         await this.executionLog.append({
           role: "runtime",
           eventType: "planner_prompt_retry_scheduled",
@@ -1735,11 +1740,10 @@ export class SecurityAgentController {
             plannerPromptId,
             attempt,
             nextAttempt: attempt + 1,
-            backoffMs: PLANNER_FRESH_SESSION_BACKOFF_MS,
+            backoffMs: retryDelayMs,
             errorKind: providerFailure.errorKind
           }
         });
-        retryDelayMs = PLANNER_FRESH_SESSION_BACKOFF_MS * attempt;
       } finally {
         clearInterval(plannerHeartbeat);
         if (plannerSessionResult) {
@@ -2772,6 +2776,27 @@ export class SecurityAgentController {
       });
       return projection;
     } catch (promptError) {
+      const fallbackProjection = isMissingStructuredSubmitError(promptError)
+        ? await this.commitMissingSubmitProjectionFallback({
+          input,
+          claim,
+          sourceEventIds: expectedSourceEventIds,
+          error: promptError,
+          metrics: {
+            fromSeq: claim.fromSeq,
+            toSeq: projectorProjectionToSeq,
+            desiredSeq: claim.toSeq,
+            durationMs: Date.now() - projectorInvocationStartedAt,
+            inputBytes: projectorInputBytes,
+            observationCount: projectorObservationCount
+          }
+        })
+        : undefined;
+      if (fallbackProjection) {
+        projectionCommitted = true;
+        projectorInvocationStatus = "degraded";
+        return fallbackProjection;
+      }
       projectorInvocationStatus = "failed";
       this.runtimeStore.releaseProjection(input.taskEnvelope.taskId, claim.generation);
       const projectionState = this.runtimeStore.getProjectionState(input.taskEnvelope.taskId);
@@ -2852,6 +2877,86 @@ export class SecurityAgentController {
         }
       }
     }
+  }
+
+  /**
+   * A missing graph_delta_submit used to leave the projection watermark pinned
+   * forever.  Subsequent retries then replayed the same observations, while the
+   * Planner only saw stale graph state.  The raw execution log is already the
+   * durable source of truth, so acknowledge this bounded range as a degraded
+   * projection after the structured tool call was exhausted.  A later range can
+   * still be projected normally; no fabricated semantic graph facts are added.
+   */
+  private async commitMissingSubmitProjectionFallback(input: {
+    input: ObserverProjectionRequest;
+    claim: ProjectionClaim;
+    sourceEventIds: string[];
+    error: unknown;
+    metrics: {
+      fromSeq: number;
+      toSeq: number;
+      desiredSeq: number;
+      durationMs: number;
+      inputBytes: number;
+      observationCount: number;
+    };
+  }): Promise<ObserverProjection | undefined> {
+    const cancellationReason = this.projectionWriteBlockedReason();
+    if (cancellationReason) {
+      return undefined;
+    }
+    const projection: ObserverProjection = {
+      graphDelta: {
+        sourceEventIds: input.sourceEventIds,
+        nodes: [],
+        edges: []
+      },
+      controlSignal: {
+        decision: "continue",
+        reason: "Projector omitted graph_delta_submit; source observations were retained in the execution log",
+        evidenceRefs: input.sourceEventIds,
+        confidence: "low"
+      }
+    };
+    const commitResult = this.graphStore.commitProjection({
+      taskId: input.input.taskEnvelope.taskId,
+      fromSeq: input.claim.fromSeq,
+      toSeq: input.metrics.toSeq,
+      generation: input.claim.generation,
+      delta: projection.graphDelta
+    });
+    projection.graphDelta = commitResult.delta;
+    this.projectionRetryCountByTask.delete(input.input.taskEnvelope.taskId);
+    const errorMessage = errorMessageFromUnknown(input.error) ?? "Projector omitted graph_delta_submit";
+    await this.executionLog.append({
+      taskId: input.input.taskEnvelope.taskId,
+      role: "observer",
+      eventType: "projection_job_degraded",
+      summary: `committed source range without semantic delta: ${errorMessage}`,
+      payload: {
+        queueId: input.input.queueId,
+        reason: input.input.reason,
+        error: errorMessage,
+        generation: input.claim.generation,
+        ...input.metrics,
+        sourceEventIds: projection.graphDelta.sourceEventIds
+      }
+    });
+    await this.appendProjectionJobLog({
+      taskId: input.input.taskEnvelope.taskId,
+      eventType: "projection_job_succeeded",
+      reason: input.input.reason,
+      projection,
+      outputPreview: "",
+      error: `degraded: ${errorMessage}`,
+      queueId: input.input.queueId,
+      generation: input.claim.generation,
+      ...input.metrics,
+      remappedNodeCount: commitResult.remappedNodeCount,
+      mergedNodeCount: commitResult.mergedNodeCount,
+      orphanNodeIds: commitResult.orphanNodeIds
+    });
+    return projection;
   }
 
   /**
@@ -3794,6 +3899,18 @@ function isRetryableProjectionError(error: unknown): boolean {
   }
   const message = errorMessageFromUnknown(error);
   return Boolean(message && isRetryableLlmErrorKind(classifyLlmErrorKind(message)));
+}
+
+function isMissingStructuredSubmitError(error: unknown): boolean {
+  return error instanceof StructuredInvocationError && error.code === "missing_submit";
+}
+
+function plannerRetryDelayMs(attempt: number): number {
+  const exponentialBackoff = PLANNER_FRESH_SESSION_BACKOFF_MS * 2 ** Math.min(Math.max(0, attempt - 1), 5);
+  const jitter = PLANNER_FRESH_SESSION_BACKOFF_JITTER_MS > 0
+    ? Math.floor(Math.random() * (PLANNER_FRESH_SESSION_BACKOFF_JITTER_MS + 1))
+    : 0;
+  return exponentialBackoff + jitter;
 }
 
 export function classifyPlannerProviderFailure(error: unknown): RetryableProviderFailure {

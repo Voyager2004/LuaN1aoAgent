@@ -1436,6 +1436,34 @@ test("projector advances committed watermark without losing prior windows", asyn
   harness.controller.close();
 });
 
+test("missing projector submission advances the watermark through a degraded projection", async () => {
+  const harness = createObserverControllerHarness("I could not submit a graph delta.");
+  harness.controllerHarness.structuredInvocationsEnabled = true;
+  const taskEnvelope = makeTaskEnvelope();
+  const sourceEvent = await persistExecutorEvent(
+    harness.controller,
+    taskEnvelope.taskId,
+    "tool_finished",
+    "HTTP/1.1 200 OK"
+  );
+  harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, sourceEvent.seq ?? 0);
+
+  const projection = await harness.controllerHarness.runProjectionJob({
+    reason: "task_end",
+    taskEnvelope,
+    sourceEventIds: [sourceEvent.id]
+  });
+
+  const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
+  const events = await harness.controller.executionLog.readAll();
+  assert.equal(state.committedSeq, state.desiredSeq);
+  assert.deepEqual(projection.graphDelta.nodes, []);
+  assert.deepEqual(projection.graphDelta.edges, []);
+  assert.ok(events.some((event) => event.eventType === "projection_job_degraded"));
+  assert.equal(events.some((event) => event.eventType === "projection_job_failed"), false);
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("projector consumes legacy non-semantic runtime tail without empty catch-up loop", async () => {
   const harness = createObserverControllerHarness(observerProjectionJson());
   const taskEnvelope = makeTaskEnvelope();

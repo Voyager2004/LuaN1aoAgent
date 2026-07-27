@@ -74,6 +74,11 @@ export type LlmRuntime = {
 const PROVIDER_NAME = "baizhi-openai";
 const AGENT_ROLES: LlmAgentRole[] = ["planner", "executor", "supervisor", "projector"];
 const DEFAULT_MAX_TOKENS = 32_768;
+// Supervisor and Projector must emit a terminating structured tool call.  They
+// need more room than a terse Executor action when the shared LLM_MAX_TOKENS
+// value is intentionally kept small for fast interactive execution.
+const DEFAULT_SUPERVISOR_MIN_TOKENS = 256;
+const DEFAULT_PROJECTOR_MIN_TOKENS = 1_024;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_THINKING_FORMAT: LlmThinkingFormat = "zai";
 const DEFAULT_THINKING_LEVEL: LlmThinkingLevel = "off";
@@ -102,9 +107,10 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
   for (const role of AGENT_ROLES) {
     const prefix = `LLM_${role.toUpperCase()}_`;
     const roleApiType = parseLlmApiType(env[`${prefix}API_TYPE`] || apiType);
+    const configuredMaxTokens = positiveIntegerValue(env[`${prefix}MAX_TOKENS`], defaultMaxTokens);
     roles[role] = {
       modelId: env[`${prefix}MODEL`] || modelId,
-      maxTokens: positiveIntegerValue(env[`${prefix}MAX_TOKENS`], defaultMaxTokens),
+      maxTokens: controlRoleMaxTokens(role, configuredMaxTokens, env),
       thinkingLevel: parseThinkingLevel(env[`${prefix}THINKING`], defaultThinkingLevel),
       apiType: roleApiType,
       baseUrl: env[`${prefix}BASE_URL`]
@@ -124,6 +130,26 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
     thinkingFormat: parseThinkingFormat(env.LLM_THINKING_FORMAT, DEFAULT_THINKING_FORMAT),
     roles
   };
+}
+
+function controlRoleMaxTokens(
+  role: LlmAgentRole,
+  configuredMaxTokens: number,
+  env: NodeJS.ProcessEnv
+): number {
+  if (role === "supervisor") {
+    return Math.max(
+      configuredMaxTokens,
+      positiveIntegerValue(env.LLM_SUPERVISOR_MIN_TOKENS, DEFAULT_SUPERVISOR_MIN_TOKENS)
+    );
+  }
+  if (role === "projector") {
+    return Math.max(
+      configuredMaxTokens,
+      positiveIntegerValue(env.LLM_PROJECTOR_MIN_TOKENS, DEFAULT_PROJECTOR_MIN_TOKENS)
+    );
+  }
+  return configuredMaxTokens;
 }
 
 export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {

@@ -146,7 +146,7 @@ export const OBSERVER_PROJECTOR_SYSTEM_PROMPT = `# Identity
 
 # Identity And Evidence Rules
 图上下文中的 existing:1、existing:2 都是已有节点，可以在 nodes 中增量更新或在 edges 中引用，不能改变其 id、graphKind 或 type。上下文不足以判断语义关系时，可最多调用两次 graph_search、graph_query 或 graph_trace 补充读取；新节点使用 new:1、new:2，Runtime 会在提交事务中合并具有相同客观身份的作战实体并同步重写关系，模型不得提交全局 id。evidenceRefs 只能使用本次 observation 别名 o1、o2；Artifact 是原始材料，不是 Evidence。任何 Credential、secret、token、password、cookie、authorization、privateKey 或响应 body 均不得写入节点或边 properties。
-禁止写入或连接 Task、Milestone、Blocker、Goal、Scope。运行时 timeout、abort 和 provider error 不是业务 Blocker。最多提交 12 个节点、20 条边，最终调用 graph_delta_submit。
+禁止写入或连接 Task、Milestone、Blocker、Goal、Scope。运行时 timeout、abort 和 provider error 不是业务 Blocker。最多提交 12 个节点、20 条边。收到 projection 输入后，第一件事就是调用 graph_delta_submit；不要先输出分析、复述或 Markdown。
 
 # Examples
 <example name="observation-versus-explanation">
@@ -184,7 +184,7 @@ export const OBSERVER_SUPERVISOR_SYSTEM_PROMPT = `你是 Observer Agent 的 Supe
 9. 缺少有效判定信号、同时改变多个独立条件后统一失败，或连续实验没有排除任何解释时，不算高价值进展；重复出现时应 checkpoint/need_planner，不应扩预算。
 10. 如果信息不足但没有明确风险，输出 continue；不要为了补证据而调用 artifact_read 或做语义投影。你不能决定任务 completed、failed 或 blocked；你只决定 Executor 是否继续、收束或交回 Planner。
 
-完成判断后必须调用 control_submit，不要输出自由文本 JSON：
+收到监督输入后必须立即调用 control_submit，不要输出分析、自由文本 JSON 或 Markdown：
 {
   "decision": "continue | checkpoint | stop_executor | need_planner",
   "reason": "监督理由",
@@ -444,7 +444,7 @@ ${input.artifactIndex}
 ${input.graphContext}
 </graph_context>
 
-请只基于以上 observations、artifact 片段和图上下文调用 graph_delta_submit。上下文不足或存在语义冲突时，最多使用两次只读图查询工具；已有节点使用 existing 别名，新节点使用 new 别名；多个 observation 支持同一语义变化时合并表达；evidenceRefs 只能使用 o1、o2 等 observation 别名。`;
+请只基于以上 observations、artifact 片段和图上下文立即调用 graph_delta_submit。不要先输出解释；上下文不足或存在语义冲突时，最多使用两次只读图查询工具；已有节点使用 existing 别名，新节点使用 new 别名；多个 observation 支持同一语义变化时合并表达；evidenceRefs 只能使用 o1、o2 等 observation 别名。`;
 }
 
 export function renderSupervisorInput(input: {

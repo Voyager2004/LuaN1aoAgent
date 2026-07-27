@@ -224,6 +224,33 @@ test("registers per-role models, budgets and thinking levels from LLM_<ROLE>_* o
   assert.equal(runtime.metadata.models.executor.modelId, "deepseek-v4-pro-202606");
 });
 
+test("keeps structured Observer roles above their safe completion floors", () => {
+  const config = loadLlmRuntimeConfig({
+    LLM_API_BASE_URL: "http://localhost:11434",
+    LLM_DEFAULT_MODEL: "local-model",
+    LLM_API_TYPE: "ollama",
+    LLM_MAX_TOKENS: "128",
+    LLM_SUPERVISOR_MAX_TOKENS: "128",
+    LLM_PROJECTOR_MAX_TOKENS: "128"
+  });
+  assert.equal(config.roles.executor.maxTokens, 128);
+  assert.equal(config.roles.supervisor.maxTokens, 256);
+  assert.equal(config.roles.projector.maxTokens, 1_024);
+
+  const explicitlyRelaxed = loadLlmRuntimeConfig({
+    LLM_API_BASE_URL: "http://localhost:11434",
+    LLM_DEFAULT_MODEL: "local-model",
+    LLM_API_TYPE: "ollama",
+    LLM_MAX_TOKENS: "128",
+    LLM_SUPERVISOR_MAX_TOKENS: "128",
+    LLM_PROJECTOR_MAX_TOKENS: "128",
+    LLM_SUPERVISOR_MIN_TOKENS: "128",
+    LLM_PROJECTOR_MIN_TOKENS: "128"
+  });
+  assert.equal(explicitlyRelaxed.roles.supervisor.maxTokens, 128);
+  assert.equal(explicitlyRelaxed.roles.projector.maxTokens, 128);
+});
+
 test("registers a dedicated provider for roles with their own base URL or API key", () => {
   const config = loadLlmRuntimeConfig({
     LLM_API_BASE_URL: "https://example.test/api/openai",
