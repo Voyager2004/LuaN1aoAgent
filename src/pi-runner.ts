@@ -32,6 +32,13 @@ export async function invokeStructured<T>(
     idleTimeoutMs?: number;
     hardTimeoutMs?: number;
     maxTruncationSteers?: number;
+    /**
+     * A completed response can omit the required terminal tool even when it
+     * was not truncated. This is common with local tool-use models after a
+     * long sequence of ordinary tools. Give callers an explicit, bounded
+     * protocol-recovery turn before classifying the invocation as malformed.
+     */
+    maxMissingSubmitSteers?: number;
     validate?: (value: unknown) => T;
   }
 ): Promise<T> {
@@ -40,6 +47,7 @@ export async function invokeStructured<T>(
   let terminalToolError = "";
   let lastAssistantStopReason = "";
   let truncationSteersUsed = 0;
+  let missingSubmitSteersUsed = 0;
   let idleTimeout: NodeJS.Timeout | undefined;
   let hardTimeout: NodeJS.Timeout | undefined;
   let resolveInvocation: (value: T) => void = () => undefined;
@@ -51,6 +59,7 @@ export async function invokeStructured<T>(
   const idleTimeoutMs = positiveTimeout(input.idleTimeoutMs);
   const hardTimeoutMs = positiveTimeout(input.hardTimeoutMs ?? input.timeoutMs);
   const maxTruncationSteers = Math.max(0, Math.floor(input.maxTruncationSteers ?? 2));
+  const maxMissingSubmitSteers = Math.max(0, Math.floor(input.maxMissingSubmitSteers ?? 0));
   const rejectOnce = (error: unknown, abortSession = false): void => {
     if (settled) {
       return;
@@ -132,6 +141,9 @@ export async function invokeStructured<T>(
     : undefined;
   const truncationSteerPrompt = `上一次响应因 max_completion_tokens 上限被截断，没有产生有效的 ${input.toolName} 调用。`
     + `立即直接调用 ${input.toolName}：先输出工具调用，用简洁参数提交当前最佳结论，不要在正文输出推理过程。`;
+  const missingSubmitSteerPrompt = `协议恢复：上一响应结束但未调用 ${input.toolName}。`
+    + `现在只调用 ${input.toolName} 一次；不要输出正文、不要调用其他工具。`
+    + `依据已有上下文提交最小且合法的当前结果。`;
   let promptCompletion = session.prompt(prompt);
   const handlePromptCompletion = (completion: Promise<void>): void => {
     void completion.then(() => {
@@ -152,6 +164,19 @@ export async function invokeStructured<T>(
         lastAssistantStopReason = "";
         resetIdleTimeout();
         promptCompletion = session.prompt(truncationSteerPrompt);
+        handlePromptCompletion(promptCompletion);
+        return;
+      }
+      if (!providerError && missingSubmitSteersUsed < maxMissingSubmitSteers) {
+        // A model may stop normally after completing useful tool work while
+        // forgetting the protocol's terminal submission. One concise repair
+        // turn is safe because it permits only the already-required terminal
+        // tool, and avoids converting useful execution into a synthetic
+        // partial result solely due to formatting drift.
+        missingSubmitSteersUsed += 1;
+        lastAssistantStopReason = "";
+        resetIdleTimeout();
+        promptCompletion = session.prompt(missingSubmitSteerPrompt);
         handlePromptCompletion(promptCompletion);
         return;
       }

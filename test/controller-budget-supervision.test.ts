@@ -93,6 +93,7 @@ type ControllerHarness = {
 type TestActiveState = {
   epochId: string;
   lifecycleState: "created" | "running" | "closing" | "closed";
+  turnEndCount: number;
   executorSession?: { abort: () => Promise<void>; clearQueue?: () => unknown; steer?: (text: string) => Promise<void> };
   executorStopRequested: boolean;
   supervisionState: {
@@ -293,6 +294,29 @@ test("same task rebuilds Supervisor state across resumed epochs", async () => {
   assert.deepEqual(resumedState.supervisionState.repeatedPatterns, ["GET /login -> 302"]);
   assert.deepEqual(resumedState.supervisionState.negativeFindings, ["Default credentials rejected"]);
   assert.deepEqual(resumedState.supervisionState.openQuestions, ["成功条件：confirm authenticated access"]);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "executor_submitted");
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("resumed Task preserves its cumulative turn budget", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({ taskId: "task:cumulative-budget" });
+  await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "turn_usage",
+    payload: {}
+  });
+  await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "turn_usage",
+    payload: {}
+  });
+
+  const resumedState = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+
+  assert.equal(resumedState.turnEndCount, 2);
   harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "executor_submitted");
   await harness.controller.close({ drainProjectionJobs: false });
 });
@@ -3460,7 +3484,7 @@ test("same partial task resumes the existing Executor session with Root Goal and
   assert.match(prompts[0] ?? "", /<root_goal>[\s\S]*\/challenge\/flag\.txt/);
   assert.match(prompts[1] ?? "", /继续执行同一个 Task/);
   assert.match(prompts[1] ?? "", /<planner_hint>[\s\S]*confirmed file-read capability/);
-  assert.match(prompts[1] ?? "", /turns: 0\/16/);
+  assert.match(prompts[1] ?? "", /turns: 1\/16/);
   assert.ok(!events.some((event) => event.eventType === "epoch_transition" && event.taskId === "task:obsolete-file-search"));
   assert.equal(controller.graphStore.getTaskNode("task:obsolete-file-search")?.properties.status, "archived");
   assert.equal(executorDisposeCount, 2);

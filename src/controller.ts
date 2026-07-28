@@ -1315,6 +1315,7 @@ export class SecurityAgentController {
         if (this.structuredInvocationsEnabled) {
           taskResult = await invokeStructured(executorSession.session, executorInput, {
             toolName: "task_result_submit",
+            maxMissingSubmitSteers: 1,
             validate: (value) => normalizeTaskResult(value as Partial<TaskResult>, taskEnvelope)
           });
         } else {
@@ -1687,6 +1688,7 @@ export class SecurityAgentController {
             toolName: "planner_submit",
             idleTimeoutMs: PLANNER_IDLE_TIMEOUT_MS,
             hardTimeoutMs: plannerHardTimeoutMs,
+            maxMissingSubmitSteers: 1,
             validate: normalizePlannerDecision
           })
           : normalizePlannerDecision(extractJsonObject<unknown>(await withTimeout(
@@ -1837,7 +1839,13 @@ export class SecurityAgentController {
       lifecycleState: "created",
       taskEnvelope,
       toolExecutionEndCount: 0,
-      turnEndCount: 0,
+      // maxTurns is a Task budget, not a budget per transient Pi session.
+      // Resume used to reset this counter, silently granting a full fresh
+      // budget after every partial result.
+      turnEndCount: this.executionLog.countTaskEvents({
+        taskId: taskEnvelope.taskId,
+        eventTypes: ["turn_usage"]
+      }),
       executorStopRequested: false,
       dynamicExecutor: false,
       attempt,
@@ -2144,7 +2152,8 @@ export class SecurityAgentController {
         ? await invokeStructured<unknown>(activeSupervisorSession, supervisorInput, {
           toolName: "control_submit",
           idleTimeoutMs: SUPERVISOR_IDLE_TIMEOUT_MS,
-          hardTimeoutMs: SUPERVISOR_HARD_TIMEOUT_MS
+          hardTimeoutMs: SUPERVISOR_HARD_TIMEOUT_MS,
+          maxMissingSubmitSteers: 1
         })
         : extractJsonObject<unknown>(await withTimeout(
           promptAndCollect(activeSupervisorSession, supervisorInput),
@@ -2708,7 +2717,8 @@ export class SecurityAgentController {
         ? await invokeStructured<unknown>(activeProjectorSession, prepared.projectorInput, {
           toolName: "graph_delta_submit",
           idleTimeoutMs: PROJECTOR_IDLE_TIMEOUT_MS,
-          hardTimeoutMs: PROJECTOR_HARD_TIMEOUT_MS
+          hardTimeoutMs: PROJECTOR_HARD_TIMEOUT_MS,
+          maxMissingSubmitSteers: 1
         })
         : extractJsonObject<unknown>(await withTimeout(
           promptAndCollect(activeProjectorSession, prepared.projectorInput),
@@ -2776,8 +2786,8 @@ export class SecurityAgentController {
       });
       return projection;
     } catch (promptError) {
-      const fallbackProjection = isMissingStructuredSubmitError(promptError)
-        ? await this.commitMissingSubmitProjectionFallback({
+      const fallbackProjection = isRecoverableProjectorSubmissionError(promptError)
+        ? await this.commitProjectorSubmissionFallback({
           input,
           claim,
           sourceEventIds: expectedSourceEventIds,
@@ -2880,14 +2890,14 @@ export class SecurityAgentController {
   }
 
   /**
-   * A missing graph_delta_submit used to leave the projection watermark pinned
-   * forever.  Subsequent retries then replayed the same observations, while the
-   * Planner only saw stale graph state.  The raw execution log is already the
+   * An unusable graph_delta_submit used to leave the projection watermark pinned
+   * forever. Subsequent retries then replayed the same observations, while the
+   * Planner only saw stale graph state. The raw execution log is already the
    * durable source of truth, so acknowledge this bounded range as a degraded
-   * projection after the structured tool call was exhausted.  A later range can
-   * still be projected normally; no fabricated semantic graph facts are added.
+   * projection after a terminal protocol failure. A later range can still be
+   * projected normally; no fabricated semantic graph facts are added.
    */
-  private async commitMissingSubmitProjectionFallback(input: {
+  private async commitProjectorSubmissionFallback(input: {
     input: ObserverProjectionRequest;
     claim: ProjectionClaim;
     sourceEventIds: string[];
@@ -2927,7 +2937,7 @@ export class SecurityAgentController {
     });
     projection.graphDelta = commitResult.delta;
     this.projectionRetryCountByTask.delete(input.input.taskEnvelope.taskId);
-    const errorMessage = errorMessageFromUnknown(input.error) ?? "Projector omitted graph_delta_submit";
+    const errorMessage = errorMessageFromUnknown(input.error) ?? "Projector did not produce a usable graph_delta_submit";
     await this.executionLog.append({
       taskId: input.input.taskEnvelope.taskId,
       role: "observer",
@@ -3901,8 +3911,9 @@ function isRetryableProjectionError(error: unknown): boolean {
   return Boolean(message && isRetryableLlmErrorKind(classifyLlmErrorKind(message)));
 }
 
-function isMissingStructuredSubmitError(error: unknown): boolean {
-  return error instanceof StructuredInvocationError && error.code === "missing_submit";
+function isRecoverableProjectorSubmissionError(error: unknown): boolean {
+  return error instanceof StructuredInvocationError
+    && ["missing_submit", "invalid_submit", "timeout"].includes(error.code);
 }
 
 function plannerRetryDelayMs(attempt: number): number {

@@ -179,6 +179,18 @@ export class ExecutionLog {
     return Number((row as { seq: number }).seq);
   }
 
+  countTaskEvents(input: { taskId: string; eventTypes: string[] }): number {
+    if (input.eventTypes.length === 0) {
+      return 0;
+    }
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM execution_events
+      WHERE task_id = ? AND event_type IN (${input.eventTypes.map(() => "?").join(",")})
+    `).get(input.taskId, ...input.eventTypes) as { count: number };
+    return Number(row.count);
+  }
+
   seqForEvent(eventId: string): number | undefined {
     const row = this.database.prepare("SELECT seq FROM execution_events WHERE id = ?")
       .get(eventId) as { seq: number } | undefined;

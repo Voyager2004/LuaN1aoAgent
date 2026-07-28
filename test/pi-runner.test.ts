@@ -199,6 +199,41 @@ test("fails with a protocol error when terminal submit is missing", async () => 
   );
 });
 
+test("repairs a normally completed response that omitted its terminal submit", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  const prompts: string[] = [];
+  const session = {
+    async prompt(text: string): Promise<void> {
+      prompts.push(text);
+      if (prompts.length === 1) {
+        emitToListeners(listeners, {
+          type: "message_end",
+          message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "checkpoint ready" }] }
+        });
+        return;
+      }
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName: "task_result_submit",
+        isError: false,
+        result: { details: { status: "partial", summary: "submitted after protocol recovery" } }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    }
+  };
+
+  assert.deepEqual(await invokeStructured(session, "test", {
+    toolName: "task_result_submit",
+    maxMissingSubmitSteers: 1
+  }), { status: "partial", summary: "submitted after protocol recovery" });
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1] ?? "", /协议恢复/);
+  assert.match(prompts[1] ?? "", /task_result_submit/);
+});
+
 test("steers the session into submitting when the response is truncated at the token limit", async () => {
   const listeners: Array<(event: unknown) => void> = [];
   const prompts: string[] = [];
