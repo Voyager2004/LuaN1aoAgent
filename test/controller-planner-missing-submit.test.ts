@@ -23,6 +23,14 @@ test("keeps planner timeouts and provider errors retryable", () => {
   assert.equal(provider.retryable, true);
 });
 
+test("does not retry an invalid Planner credential", () => {
+  const failure = classifyPlannerProviderFailure(
+    new StructuredInvocationError("401 {\"error\":{\"message\":\"Invalid API Key\"}}", "provider_error")
+  );
+  assert.equal(failure.errorKind, "llm_error");
+  assert.equal(failure.retryable, false);
+});
+
 test("keeps invalid_submit retryable and tool_error non-retryable", () => {
   const invalid = classifyPlannerProviderFailure(
     new StructuredInvocationError("Validation failed for tool planner_submit", "invalid_submit")

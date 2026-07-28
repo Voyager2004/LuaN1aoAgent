@@ -3931,7 +3931,13 @@ export function classifyPlannerProviderFailure(error: unknown): RetryableProvide
       return { errorKind: "provider_timeout", message, retryable: true };
     }
     if (error.code === "provider_error") {
-      return { errorKind: classifyLlmErrorKind(message), message, retryable: true };
+      const errorKind = classifyLlmErrorKind(message);
+      // `provider_error` is a transport envelope, not evidence that the
+      // underlying failure is transient. Retrying a rejected credential or a
+      // malformed provider configuration only burns the run budget and masks
+      // the actionable diagnosis. Keep retries for the explicit transient
+      // kinds classified below (429, concurrency, timeout, 5xx).
+      return { errorKind, message, retryable: isRetryableLlmErrorKind(errorKind) };
     }
     if (error.code === "invalid_submit") {
       return { errorKind: "llm_error", message, retryable: true };
