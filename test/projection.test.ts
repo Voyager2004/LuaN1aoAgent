@@ -576,6 +576,28 @@ test("projector derives stable tunnel and proxy route edge identities", () => {
   assert.equal(delta.edges[1]?.properties?.via, "127.0.0.1:8080");
 });
 
+test("projector drops topology edges whose endpoint types violate graph invariants", () => {
+  const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
+  const delta = expandProjectionDraft({
+    batch: { observations: [], toSeq: 0, sourceEventIds: [] },
+    graphContext,
+    value: {
+      nodes: [
+        { id: "new:1", graphKind: "operation", type: "WebEndpoint", label: "/orders", properties: {} },
+        { id: "new:2", graphKind: "operation", type: "Session", label: "test session", properties: {} },
+        { id: "new:3", graphKind: "operation", type: "Host", label: "target", properties: { host: "target.test" } }
+      ],
+      edges: [
+        { from: "new:1", to: "new:2", type: "tunnels_to", properties: { tunnelId: "not-a-tunnel" } },
+        { from: "new:1", to: "new:2", type: "proxy_route", properties: { routeId: "not-a-route" } },
+        { from: "new:2", to: "new:3", type: "session_on", properties: {} }
+      ]
+    }
+  });
+
+  assert.deepEqual(delta.edges.map((edge) => edge.type), ["session_on"]);
+});
+
 test("canonical operation identities cover agent and shell sessions", () => {
   const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
   const delta = expandProjectionDraft({

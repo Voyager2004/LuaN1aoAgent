@@ -395,7 +395,8 @@ export function expandProjectionDraft(input: {
       const toNode = nodeById.get(edge.to);
       return Boolean(fromNode && toNode)
         && fromNode?.graphKind !== "task"
-        && toNode?.graphKind !== "task";
+        && toNode?.graphKind !== "task"
+        && projectorEdgeHasCompatibleEndpoints(edge, fromNode, toNode);
     })
     : [];
   return {
@@ -403,6 +404,30 @@ export function expandProjectionDraft(input: {
     nodes,
     edges
   };
+}
+
+/**
+ * Projector output is schema-checked before it reaches this expansion step, but
+ * some edge names have endpoint-type invariants that JSON Schema cannot express.
+ * Dropping just an incompatible edge preserves all usable evidence and prevents
+ * one hallucinated topology relation from rejecting the whole projection batch.
+ */
+function projectorEdgeHasCompatibleEndpoints(
+  edge: Pick<GraphEdge, "type">,
+  fromNode: GraphNode | undefined,
+  toNode: GraphNode | undefined
+): boolean {
+  if (!fromNode || !toNode) {
+    return false;
+  }
+  if (edge.type === "tunnels_to" || edge.type === "proxy_route") {
+    return fromNode.type === "Host" && toNode.type === "Host";
+  }
+  if (edge.type === "session_on") {
+    return ["AgentSession", "ShellSession", "Session"].includes(fromNode.type)
+      && toNode.type === "Host";
+  }
+  return true;
 }
 
 export function renderProjectionObservations(observations: ProjectionObservation[]): string {
