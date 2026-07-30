@@ -1,4 +1,4 @@
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { compactExecutionEvents } from "../log-summary.js";
 import type { ArtifactStore } from "../stores/artifact-store.js";
@@ -178,6 +178,14 @@ const ProjectorGraphEdgeSchema = Type.Object({
   evidenceRefs: Type.Optional(Type.Array(Type.String({ maxLength: 32 }), { maxItems: 8 }))
 }, { additionalProperties: false });
 
+const ProjectorGraphNodeArraySchema = Type.Array(ProjectorGraphNodeSchema, { maxItems: 12 });
+const ProjectorGraphEdgeArraySchema = Type.Array(ProjectorGraphEdgeSchema, { maxItems: 20 });
+const GraphDeltaSubmitParameters = Type.Object({
+  nodes: ProjectorGraphNodeArraySchema,
+  edges: ProjectorGraphEdgeArraySchema
+}, { additionalProperties: false });
+type GraphDeltaSubmitParams = Static<typeof GraphDeltaSubmitParameters>;
+
 const PlannerTaskIdSchema = Type.String({ pattern: "^task:.+", minLength: 6, maxLength: 256 });
 const PlannerNodeIdSchema = Type.String({ minLength: 1, maxLength: 256 });
 const PlannerRefArraySchema = Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 });
@@ -344,16 +352,38 @@ export function createGraphDeltaSubmitTool() {
     name: "graph_delta_submit",
     label: "Submit Graph Delta",
     description: "Submit the final Projector GraphDelta and terminate this Projector invocation.",
-    parameters: Type.Object({
-      nodes: Type.Array(ProjectorGraphNodeSchema, { maxItems: 12 }),
-      edges: Type.Array(ProjectorGraphEdgeSchema, { maxItems: 20 })
-    }, { additionalProperties: false }),
+    parameters: GraphDeltaSubmitParameters,
+    prepareArguments: prepareGraphDeltaSubmitArguments,
     execute: async (_toolCallId, params) => ({
       content: [{ type: "text", text: "Graph delta submitted" }],
       details: params,
       terminate: true
     })
   });
+}
+
+function prepareGraphDeltaSubmitArguments(args: unknown): GraphDeltaSubmitParams {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return args as GraphDeltaSubmitParams;
+  }
+  const input = args as Record<string, unknown>;
+  return {
+    ...input,
+    nodes: decodeSerializedArray(input.nodes),
+    edges: decodeSerializedArray(input.edges)
+  } as GraphDeltaSubmitParams;
+}
+
+function decodeSerializedArray(value: unknown): unknown {
+  if (typeof value !== "string" || value.length > 48_000) {
+    return value;
+  }
+  try {
+    const decoded = JSON.parse(value);
+    return Array.isArray(decoded) ? decoded : value;
+  } catch {
+    return value;
+  }
 }
 
 export function createGraphQueryTool(graphStore: SQLiteGraphStore) {

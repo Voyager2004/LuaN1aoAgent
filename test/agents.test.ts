@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Check } from "typebox/value";
 import { createExecutorResearchTools, observerToolsForMode } from "../src/agents.js";
 import { createGraphDeltaSubmitTool, createPlannerSubmitTool } from "../src/tools/pi-tools.js";
 import type { ArtifactStore } from "../src/stores/artifact-store.js";
@@ -91,6 +92,58 @@ test("projector terminal tool accepts bounded task-shaped drafts for determinist
   );
   assert.equal(schema.properties.sourceEventIds, undefined);
   assert.equal(schema.additionalProperties, false);
+});
+
+test("projector terminal tool prepares JSON-serialized node and edge arrays before strict validation", () => {
+  const tool = createGraphDeltaSubmitTool();
+  const nodes = [{
+    id: "new:1",
+    label: "HTTP service",
+    graphKind: "operation",
+    type: "Service",
+    properties: { product: "example" },
+    evidenceRefs: ["o1"]
+  }];
+  const edges: [] = [];
+  const prepareArguments = tool.prepareArguments;
+  assert.ok(prepareArguments);
+  const prepared = prepareArguments({ nodes: JSON.stringify(nodes), edges: JSON.stringify(edges) });
+
+  assert.deepEqual(prepared, { nodes, edges });
+  assert.equal(Check(tool.parameters, prepared), true);
+  assert.deepEqual(prepareArguments({ nodes, edges }), { nodes, edges });
+});
+
+test("projector terminal tool leaves invalid serialized fields for strict schema rejection", () => {
+  const tool = createGraphDeltaSubmitTool();
+  const prepareArguments = tool.prepareArguments;
+  assert.ok(prepareArguments);
+  const malformed = { nodes: "{not-json", edges: "[]" };
+  const nonArray = { nodes: "{}", edges: "[]" };
+  const nestedString = { nodes: JSON.stringify(["not-a-node"]), edges: "[]" };
+  const oversized = { nodes: "[" + " ".repeat(48_001) + "]", edges: "[]" };
+  const extraTopLevel = { nodes: "[]", edges: "[]", unexpected: "retain-for-validation" };
+  const nestedProperty = {
+    nodes: JSON.stringify([{
+      id: "new:1",
+      label: "service",
+      graphKind: "operation",
+      type: "Service",
+      properties: { serialized: "[\"leave\",\"as text\"]" }
+    }]),
+    edges: "[]"
+  };
+
+  assert.deepEqual(prepareArguments(malformed), { nodes: malformed.nodes, edges: [] });
+  assert.deepEqual(prepareArguments(nonArray), { nodes: nonArray.nodes, edges: [] });
+  assert.equal(Check(tool.parameters, prepareArguments(malformed)), false);
+  assert.equal(Check(tool.parameters, prepareArguments(nonArray)), false);
+  assert.equal(Check(tool.parameters, prepareArguments(nestedString)), false);
+  assert.equal(Check(tool.parameters, prepareArguments(oversized)), false);
+  assert.equal(Check(tool.parameters, prepareArguments(extraTopLevel)), false);
+  const nestedPrepared = prepareArguments(nestedProperty) as { nodes: Array<{ properties?: Record<string, unknown> }> };
+  assert.equal(nestedPrepared.nodes[0]?.properties?.serialized, "[\"leave\",\"as text\"]");
+  assert.equal(Check(tool.parameters, nestedPrepared), true);
 });
 
 test("planner terminal tool exposes discriminated command schemas", () => {
