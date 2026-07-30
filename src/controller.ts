@@ -210,7 +210,15 @@ type ActiveTaskState = {
   taskEnvelope: TaskEnvelope;
   toolExecutionEndCount: number;
   turnEndCount: number;
+  // Count provider-bound Executor turns synchronously at Pi's turn_start
+  // boundary. Persisted turn_usage callbacks are intentionally asynchronous,
+  // so they cannot be the only guard for a per-Task turn budget.
+  executorTurnStartCount: number;
   executorStopRequested: boolean;
+  // A graceful checkpoint may use exactly one terminal-only model turn to
+  // submit its TaskResult. All ordinary turns are denied once closing begins.
+  checkpointTerminalTurnsRemaining: number;
+  restoreCheckpointTools?: () => void;
   controlSignal?: ControlSignal;
   abortContext?: RuntimeAbortContext;
   taskTimer?: NodeJS.Timeout;
@@ -1322,7 +1330,7 @@ export class SecurityAgentController {
         getTaskId: () => taskEnvelope.taskId,
         getEpochId: () => state.epochId,
         getAbortContext: () => state.abortContext,
-        onTurnStart: () => this.tryAcquireGlobalLlmTurn(),
+        onTurnStart: () => this.admitExecutorTurn(taskEnvelope, state),
         onPersistedEvent: (event) => this.handleExecutorEventPersisted(event)
       });
       this.armEpochTimeSlice(taskEnvelope);
@@ -1883,6 +1891,39 @@ export class SecurityAgentController {
     return false;
   }
 
+  /**
+   * Gate Executor turns before Pi sends a provider request.  The global
+   * budget is shared by all roles, while the local Task budget must also stay
+   * strict when event persistence or Supervisor work lags behind a tool loop.
+   */
+  private admitExecutorTurn(taskEnvelope: TaskEnvelope, state: ActiveTaskState): boolean {
+    if (state.lifecycleState === "closed") {
+      return false;
+    }
+    const maxTurns = taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns;
+    if (!state.executorStopRequested && state.executorTurnStartCount >= maxTurns) {
+      // This is a race-safe fallback for a fast Pi loop that reaches
+      // turn_start before its prior turn_usage callback has been persisted.
+      this.requestBudgetCheckpoint(taskEnvelope, undefined, "maxTurns", state);
+    }
+    if (state.executorStopRequested) {
+      if (state.checkpointTerminalTurnsRemaining <= 0) {
+        return false;
+      }
+      if (!this.tryAcquireGlobalLlmTurn()) {
+        return false;
+      }
+      state.checkpointTerminalTurnsRemaining -= 1;
+      state.executorTurnStartCount += 1;
+      return true;
+    }
+    if (!this.tryAcquireGlobalLlmTurn()) {
+      return false;
+    }
+    state.executorTurnStartCount += 1;
+    return true;
+  }
+
   private isGlobalLlmTurnBudgetExhausted(): boolean {
     const activeRun = this.activeRun;
     return activeRun?.maxLlmTurns !== undefined
@@ -1949,7 +1990,20 @@ export class SecurityAgentController {
         eventTypes: ["turn_usage"],
         roles: ["executor"]
       }),
+      executorTurnStartCount: Math.max(
+        this.executionLog.countTaskEvents({
+          taskId: taskEnvelope.taskId,
+          eventTypes: ["llm_turn_started"],
+          roles: ["executor"]
+        }),
+        this.executionLog.countTaskEvents({
+          taskId: taskEnvelope.taskId,
+          eventTypes: ["turn_usage"],
+          roles: ["executor"]
+        })
+      ),
       executorStopRequested: false,
+      checkpointTerminalTurnsRemaining: 0,
       dynamicExecutor: false,
       attempt,
       budgetExtensionCount: 0,
@@ -1992,6 +2046,15 @@ export class SecurityAgentController {
     if (state?.checkpointGraceTimer) {
       clearTimeout(state.checkpointGraceTimer);
       state.checkpointGraceTimer = undefined;
+    }
+    if (state?.restoreCheckpointTools) {
+      try {
+        state.restoreCheckpointTools();
+      } catch {
+        // A terminated Pi session can reject a late tool-set restore. The
+        // epoch is already closed, so this must not replace its outcome.
+      }
+      state.restoreCheckpointTools = undefined;
     }
     if (state) {
       this.activeEpochs.delete(state.epochId);
@@ -2102,7 +2165,14 @@ export class SecurityAgentController {
         sourceEventId: event.id,
         reason: "turn_usage"
       });
-      if (state.turnEndCount >= (taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns)) {
+      if (remainingTurns(taskEnvelope, state) <= 0) {
+        // A Supervisor invocation can take long enough for Pi to start more
+        // Executor turns. At the hard boundary, checkpoint synchronously and
+        // reserve only its terminal submission turn.
+        this.requestBudgetCheckpoint(taskEnvelope, event, "maxTurns", state);
+      } else if (remainingTurns(taskEnvelope, state) <= BUDGET_PRESSURE_TURNS) {
+        // Ask about an extension while ordinary budget remains. A late answer
+        // cannot reopen a Task once the hard checkpoint has started.
         this.requestSupervisorBudgetDecision(taskEnvelope, event, state);
       } else if (state.turnEndCount % SUPERVISOR_TURN_WINDOW_SIZE === 0) {
         void this.enqueueSupervisorCheck({
@@ -3360,7 +3430,7 @@ export class SecurityAgentController {
 
   private requestBudgetCheckpoint(
     taskEnvelope: TaskEnvelope,
-    event: ExecutionEvent,
+    event: Pick<ExecutionEvent, "id"> | undefined,
     budgetKey: "maxTurns",
     state = this.getActiveTaskState(taskEnvelope.taskId)
   ): void {
@@ -3371,7 +3441,7 @@ export class SecurityAgentController {
     const budgetSignal: ControlSignal = {
       decision: "checkpoint",
       reason: `Task budget reached: ${budgetKey}=${limit}`,
-      evidenceRefs: [event.id],
+      evidenceRefs: event?.id ? [event.id] : state.lastEventId ? [state.lastEventId] : [],
       confidence: "high"
     };
     this.applyControlSignal(taskEnvelope, budgetSignal, state);
@@ -3563,6 +3633,32 @@ export class SecurityAgentController {
     void state.executorSession?.abort();
   }
 
+  private restrictExecutorToTerminalSubmit(state: ActiveTaskState): (() => void) | undefined {
+    const session = state.executorSession as (
+      SecurityAgentSession & {
+        getActiveToolNames?: () => string[];
+        setActiveToolsByName?: (toolNames: string[]) => void;
+        getActiveTools?: () => string[];
+        setActiveTools?: (toolNames: string[]) => void;
+      }
+    ) | undefined;
+    const getActiveTools = session?.getActiveToolNames ?? session?.getActiveTools;
+    const setActiveTools = session?.setActiveToolsByName ?? session?.setActiveTools;
+    if (!session || !getActiveTools || !setActiveTools) {
+      return undefined;
+    }
+    try {
+      const previous = [...getActiveTools.call(session)];
+      if (!previous.includes("task_result_submit")) {
+        return undefined;
+      }
+      setActiveTools.call(session, ["task_result_submit"]);
+      return () => setActiveTools.call(session, previous);
+    } catch {
+      return undefined;
+    }
+  }
+
   private requestGracefulExecutorCheckpoint(
     taskEnvelope: TaskEnvelope,
     controlSignal: ControlSignal,
@@ -3572,10 +3668,30 @@ export class SecurityAgentController {
     this.runtimeStore.transitionEpoch({ epochId: state.epochId, state: "closing" });
     state.executorStopRequested = true;
     state.abortContext = createRuntimeAbortContext(controlSignal);
+    const restoreCheckpointTools = this.restrictExecutorToTerminalSubmit(state);
+    if (!restoreCheckpointTools) {
+      void this.executionLog.append({
+        epochId: state.epochId,
+        taskId: taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "executor_checkpoint_requested",
+        summary: controlSignal.reason,
+        payload: {
+          controlSignal,
+          delivery: "none",
+          graceMs: 0,
+          terminalToolMode: "unavailable"
+        }
+      });
+      this.terminateExecutorSession(state);
+      return;
+    }
+    state.restoreCheckpointTools = restoreCheckpointTools;
+    state.checkpointTerminalTurnsRemaining = 1;
     const checkpointMessage = [
       "RUNTIME_CHECKPOINT_REQUEST:",
       controlSignal.reason,
-      "停止扩展探索。先完成进行中的取证动作（读取已确认的关键内容、保存 artifact），再调用 task_result_submit 提交当前阶段已经确认的事实、失败结论、关键响应内容和 artifact 引用。",
+      "停止扩展探索。当前仅允许调用 task_result_submit；直接提交当前阶段已经确认的事实、失败结论、关键响应内容和 artifact 引用。",
       "本次 checkpoint 不代表 completed 或 blocked；状态由你的 TaskResult 和后续 Planner 决定。"
     ].join("\n");
     const steeringQueued = this.queueExecutorSteer(
@@ -3594,10 +3710,18 @@ export class SecurityAgentController {
       payload: {
         controlSignal,
         delivery: steeringQueued ? "steer" : "none",
-        graceMs: steeringQueued ? EXECUTOR_CHECKPOINT_GRACE_MS : 0
+        graceMs: steeringQueued ? EXECUTOR_CHECKPOINT_GRACE_MS : 0,
+        terminalToolMode: "task_result_submit",
+        terminalTurnsRemaining: state.checkpointTerminalTurnsRemaining
       }
     });
     if (!steeringQueued) {
+      state.checkpointTerminalTurnsRemaining = 0;
+      try {
+        state.restoreCheckpointTools?.();
+      } catch {
+      }
+      state.restoreCheckpointTools = undefined;
       this.terminateExecutorSession(state);
       return;
     }
@@ -4607,7 +4731,10 @@ function ensureTaskBudget(taskEnvelope: TaskEnvelope): Required<TaskBudget> {
 
 function budgetStatusSnapshot(taskEnvelope: TaskEnvelope, state?: ActiveTaskState): Record<string, unknown> {
   const budget = normalizeTaskBudget(taskEnvelope.budget);
-  const usedTurns = state?.turnEndCount ?? 0;
+  const usedTurns = Math.max(
+    state?.turnEndCount ?? 0,
+    state?.executorTurnStartCount ?? 0
+  );
   const remaining = Math.max(0, budget.maxTurns - usedTurns);
   return {
     taskId: taskEnvelope.taskId,
@@ -4633,7 +4760,10 @@ function budgetStatusSnapshot(taskEnvelope: TaskEnvelope, state?: ActiveTaskStat
 
 function remainingTurns(taskEnvelope: TaskEnvelope, state: ActiveTaskState): number {
   const budget = normalizeTaskBudget(taskEnvelope.budget);
-  return Math.max(0, budget.maxTurns - state.turnEndCount);
+  return Math.max(0, budget.maxTurns - Math.max(
+    state.turnEndCount,
+    state.executorTurnStartCount
+  ));
 }
 
 function budgetStatusSteerKey(

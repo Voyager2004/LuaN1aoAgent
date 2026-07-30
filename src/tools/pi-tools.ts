@@ -436,7 +436,7 @@ export function createGraphQueryTool(graphStore: SQLiteGraphStore) {
   return defineTool({
     name: "graph_query",
     label: "Graph Query",
-    description: "Read a bounded tri-graph view when the initial planner decision view is insufficient. This is read-only and does not expose raw logs or artifacts.",
+    description: "Read a bounded tri-graph view when the initial planner decision view is insufficient. This is read-only and does not expose raw logs or artifacts. The view must be exactly one literal string: planner, reasoning, operation, task, or sessions; never pass a JSON object, serialized object, or natural-language query as view.",
     parameters: Type.Object({
       view: Type.Union([
         Type.Literal("planner"),

@@ -21,7 +21,13 @@ import type { ControlSignal, ExecutionEvent, ObserverProjection, PlannerDecision
 type ControllerHarness = {
   agents: {
     planner: unknown;
-    executor: { abort: () => Promise<void>; clearQueue?: () => unknown; steer?: (text: string) => Promise<void> };
+    executor: {
+      abort: () => Promise<void>;
+      clearQueue?: () => unknown;
+      steer?: (text: string) => Promise<void>;
+      getActiveToolNames?: () => string[];
+      setActiveToolsByName?: (toolNames: string[]) => void;
+    };
     observer: unknown;
   };
   activeEpochs?: Map<string, unknown>;
@@ -38,6 +44,7 @@ type ControllerHarness = {
   runProjectionJob: (input: unknown) => Promise<ObserverProjection>;
   runSupervisorCheck: (input: unknown) => Promise<ControlSignal>;
   applyControlSignal: (taskEnvelope: TaskEnvelope, controlSignal: ControlSignal, state?: TestActiveState) => void;
+  admitExecutorTurn: (taskEnvelope: TaskEnvelope, state: TestActiveState) => boolean;
   handleExecutorEventPersisted: (event: ExecutionEvent) => Promise<void>;
   armEpochTimeSlice: (taskEnvelope: TaskEnvelope) => void;
   clearEpochTimeSlice: () => void;
@@ -94,7 +101,15 @@ type TestActiveState = {
   epochId: string;
   lifecycleState: "created" | "running" | "closing" | "closed";
   turnEndCount: number;
-  executorSession?: { abort: () => Promise<void>; clearQueue?: () => unknown; steer?: (text: string) => Promise<void> };
+  executorTurnStartCount: number;
+  checkpointTerminalTurnsRemaining: number;
+  executorSession?: {
+    abort: () => Promise<void>;
+    clearQueue?: () => unknown;
+    steer?: (text: string) => Promise<void>;
+    getActiveToolNames?: () => string[];
+    setActiveToolsByName?: (toolNames: string[]) => void;
+  };
   executorStopRequested: boolean;
   supervisionState: {
     progressDigest: string;
@@ -248,6 +263,28 @@ test("requests graceful TaskResult handoff when observer requests checkpoint", a
 
   await waitFor(async () => harness.steers().some((message) => message.includes("RUNTIME_CHECKPOINT_REQUEST")));
   assert.equal(harness.abortCount(), 0);
+  harness.controller.close();
+});
+
+test("checkpoint admits only one terminal-only Executor turn", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = activateTask(harness.controllerHarness, taskEnvelope);
+
+  harness.controllerHarness.applyControlSignal(taskEnvelope, {
+    decision: "checkpoint",
+    reason: "handoff to planner",
+    evidenceRefs: ["event:checkpoint"],
+    confidence: "high"
+  });
+
+  await waitFor(async () => harness.steers().some((message) => message.includes("RUNTIME_CHECKPOINT_REQUEST")));
+  assert.deepEqual(state.executorSession?.getActiveToolNames?.(), ["task_result_submit"]);
+  assert.equal(harness.controllerHarness.admitExecutorTurn(taskEnvelope, state), true);
+  assert.equal(harness.controllerHarness.admitExecutorTurn(taskEnvelope, state), false);
+  assert.equal(state.executorTurnStartCount, 1);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "supervisor_checkpoint");
+  assert.ok(state.executorSession?.getActiveToolNames?.().includes("bash"));
   harness.controller.close();
 });
 
@@ -655,8 +692,8 @@ test("extends turn budget when Supervisor grants a budget extension", async () =
   const taskEnvelope = makeTaskEnvelope({ budget: { maxTurns: MIN_TASK_BUDGET.maxTurns } });
   activateTask(harness.controllerHarness, taskEnvelope);
 
-  for (let index = 0; index < MIN_TASK_BUDGET.maxTurns; index += 1) {
-    harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
+  for (let index = 0; index < MIN_TASK_BUDGET.maxTurns - 2; index += 1) {
+    await harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
       taskEnvelope.taskId,
       "turn_end",
       {},
@@ -666,7 +703,15 @@ test("extends turn budget when Supervisor grants a budget extension", async () =
 
   await waitFor(async () => (await harness.controller.executionLog.readAll())
     .some((event) => event.eventType === "budget_extension_granted"));
-  assert.ok((taskEnvelope.budget?.maxTurns ?? 0) > 1);
+  assert.ok((taskEnvelope.budget?.maxTurns ?? 0) > MIN_TASK_BUDGET.maxTurns);
+  for (let index = MIN_TASK_BUDGET.maxTurns - 2; index < MIN_TASK_BUDGET.maxTurns; index += 1) {
+    await harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
+      taskEnvelope.taskId,
+      "turn_end",
+      {},
+      `event:turn:${index}`
+    ));
+  }
   assert.equal((await harness.controller.executionLog.readAll())
     .some((event) => event.eventType === "executor_stop_requested"), false);
   harness.controller.close();
@@ -692,6 +737,21 @@ test("forces checkpoint when maxTurns budget is reached", async () => {
   assert.ok(harness.steers().some((message) => message.includes(
     `Task budget reached: maxTurns=${MIN_TASK_BUDGET.maxTurns}`
   )));
+  harness.controller.close();
+});
+
+test("turn-start gate converts a persistence race into one terminal turn", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({ budget: { maxTurns: MIN_TASK_BUDGET.maxTurns } });
+  const state = activateTask(harness.controllerHarness, taskEnvelope);
+  state.executorTurnStartCount = MIN_TASK_BUDGET.maxTurns;
+
+  assert.equal(harness.controllerHarness.admitExecutorTurn(taskEnvelope, state), true);
+  assert.equal(state.executorStopRequested, true);
+  assert.equal(state.executorTurnStartCount, MIN_TASK_BUDGET.maxTurns + 1);
+  assert.deepEqual(state.executorSession?.getActiveToolNames?.(), ["task_result_submit"]);
+  assert.equal(harness.controllerHarness.admitExecutorTurn(taskEnvelope, state), false);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "supervisor_checkpoint");
   harness.controller.close();
 });
 
@@ -4356,6 +4416,7 @@ function createControllerHarness(): {
   const controllerHarness = controller as unknown as ControllerHarness;
   let abortCount = 0;
   const steerTexts: string[] = [];
+  let activeExecutorTools = ["bash", "read", "task_result_submit"];
   controllerHarness.agents = {
     planner: {},
     observer: {},
@@ -4365,6 +4426,12 @@ function createControllerHarness(): {
       },
       async abort(): Promise<void> {
         abortCount += 1;
+      },
+      getActiveToolNames(): string[] {
+        return [...activeExecutorTools];
+      },
+      setActiveToolsByName(toolNames: string[]): void {
+        activeExecutorTools = [...toolNames];
       }
     }
   };
@@ -4405,11 +4472,19 @@ function createObserverControllerHarness(observerOutput: string): {
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const controllerHarness = controller as unknown as ControllerHarness;
   const observerSession = createAbortableMockTextSession(observerOutput);
+  let activeExecutorTools = ["bash", "read", "task_result_submit"];
   controllerHarness.agents = {
     planner: createMockTextSession("{}"),
     observer: observerSession,
     executor: {
-      async abort(): Promise<void> {}
+      async abort(): Promise<void> {},
+      async steer(): Promise<void> {},
+      getActiveToolNames(): string[] {
+        return [...activeExecutorTools];
+      },
+      setActiveToolsByName(toolNames: string[]): void {
+        activeExecutorTools = [...toolNames];
+      }
     }
   };
   controllerHarness.createObserverSessionForMode = async () => ({
@@ -4466,10 +4541,11 @@ function activateTask(
   controllerHarness: ControllerHarness,
   taskEnvelope: TaskEnvelope,
   overrides: { executorStopRequested?: boolean } = {}
-): void {
+): TestActiveState {
   const state = controllerHarness.beginTaskExecution(taskEnvelope);
   state.executorSession = controllerHarness.agents.executor;
   state.executorStopRequested = overrides.executorStopRequested ?? false;
+  return state;
 }
 
 function makeExecutionEvent(
