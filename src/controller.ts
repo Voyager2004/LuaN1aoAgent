@@ -1945,7 +1945,8 @@ export class SecurityAgentController {
       // budget after every partial result.
       turnEndCount: this.executionLog.countTaskEvents({
         taskId: taskEnvelope.taskId,
-        eventTypes: ["turn_usage"]
+        eventTypes: ["turn_usage"],
+        roles: ["executor"]
       }),
       executorStopRequested: false,
       dynamicExecutor: false,

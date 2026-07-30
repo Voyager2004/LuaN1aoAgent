@@ -36,10 +36,12 @@ test("counts selected events for one task", async () => {
   await executionLog.append({ taskId: "task:a", role: "executor", eventType: "turn_usage", payload: {} });
   await executionLog.append({ taskId: "task:a", role: "executor", eventType: "tool_finished", payload: {} });
   await executionLog.append({ taskId: "task:a", role: "executor", eventType: "turn_usage", payload: {} });
+  await executionLog.append({ taskId: "task:a", role: "observer", eventType: "turn_usage", payload: {} });
   await executionLog.append({ taskId: "task:b", role: "executor", eventType: "turn_usage", payload: {} });
 
-  assert.equal(executionLog.countTaskEvents({ taskId: "task:a", eventTypes: ["turn_usage"] }), 2);
-  assert.equal(executionLog.countTaskEvents({ taskId: "task:a", eventTypes: ["turn_usage", "tool_finished"] }), 3);
+  assert.equal(executionLog.countTaskEvents({ taskId: "task:a", eventTypes: ["turn_usage"] }), 3);
+  assert.equal(executionLog.countTaskEvents({ taskId: "task:a", eventTypes: ["turn_usage"], roles: ["executor"] }), 2);
+  assert.equal(executionLog.countTaskEvents({ taskId: "task:a", eventTypes: ["turn_usage", "tool_finished"] }), 4);
   assert.equal(executionLog.countTaskEvents({ taskId: "task:a", eventTypes: [] }), 0);
   executionLog.close();
 });

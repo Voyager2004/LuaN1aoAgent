@@ -179,15 +179,28 @@ export class ExecutionLog {
     return Number((row as { seq: number }).seq);
   }
 
-  countTaskEvents(input: { taskId: string; eventTypes: string[] }): number {
+  countTaskEvents(input: {
+    taskId: string;
+    eventTypes: string[];
+    roles?: Array<AgentRole | "runtime">;
+  }): number {
     if (input.eventTypes.length === 0) {
       return 0;
+    }
+    const where = [
+      "task_id = ?",
+      `event_type IN (${input.eventTypes.map(() => "?").join(",")})`
+    ];
+    const parameters: string[] = [input.taskId, ...input.eventTypes];
+    if (input.roles && input.roles.length > 0) {
+      where.push(`role IN (${input.roles.map(() => "?").join(",")})`);
+      parameters.push(...input.roles);
     }
     const row = this.database.prepare(`
       SELECT COUNT(*) AS count
       FROM execution_events
-      WHERE task_id = ? AND event_type IN (${input.eventTypes.map(() => "?").join(",")})
-    `).get(input.taskId, ...input.eventTypes) as { count: number };
+      WHERE ${where.join(" AND ")}
+    `).get(...parameters) as { count: number };
     return Number(row.count);
   }
 

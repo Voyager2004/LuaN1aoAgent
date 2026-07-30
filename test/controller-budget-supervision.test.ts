@@ -3416,6 +3416,15 @@ test("same partial task resumes the existing Executor session with Root Goal and
   let executorFactoryCount = 0;
   const executorSession = {
     ...executorBase,
+    subscribe(listener: (event: unknown) => void): () => void {
+      return executorBase.subscribe((event) => {
+        listener(event);
+        const typedEvent = event as { type?: string; message?: unknown };
+        if (typedEvent.type === "message_end") {
+          listener({ type: "turn_end", message: typedEvent.message });
+        }
+      });
+    },
     sessionFile: "/tmp/mock-primary-session.jsonl",
     async abort(): Promise<void> {},
     dispose(): void {
