@@ -114,6 +114,34 @@ test("projector terminal tool prepares JSON-serialized node and edge arrays befo
   assert.deepEqual(prepareArguments({ nodes, edges }), { nodes, edges });
 });
 
+test("projector terminal tool repairs a node category implied by its known type before validation", () => {
+  const tool = createGraphDeltaSubmitTool();
+  const prepareArguments = tool.prepareArguments;
+  assert.ok(prepareArguments);
+  const prepared = prepareArguments({
+    nodes: JSON.stringify([{
+      id: "new:1",
+      label: "default credential hint",
+      graphKind: "reasoning",
+      type: "Credential",
+      properties: {},
+      evidenceRefs: ["o1"]
+    }]),
+    edges: "[]"
+  }) as { nodes: Array<{ graphKind: string; type: string }>; edges: unknown[] };
+
+  assert.deepEqual(prepared.nodes, [{
+    id: "new:1",
+    label: "default credential hint",
+    graphKind: "operation",
+    type: "Credential",
+    properties: {},
+    evidenceRefs: ["o1"]
+  }]);
+  assert.deepEqual(prepared.edges, []);
+  assert.equal(Check(tool.parameters, prepared), true);
+});
+
 test("projector terminal tool leaves invalid serialized fields for strict schema rejection", () => {
   const tool = createGraphDeltaSubmitTool();
   const prepareArguments = tool.prepareArguments;
@@ -123,6 +151,15 @@ test("projector terminal tool leaves invalid serialized fields for strict schema
   const nestedString = { nodes: JSON.stringify(["not-a-node"]), edges: "[]" };
   const oversized = { nodes: "[" + " ".repeat(48_001) + "]", edges: "[]" };
   const extraTopLevel = { nodes: "[]", edges: "[]", unexpected: "retain-for-validation" };
+  const unknownCategory = {
+    nodes: JSON.stringify([{
+      id: "new:1",
+      label: "invalid category",
+      graphKind: "unexpected",
+      type: "Credential"
+    }]),
+    edges: "[]"
+  };
   const nestedProperty = {
     nodes: JSON.stringify([{
       id: "new:1",
@@ -141,6 +178,7 @@ test("projector terminal tool leaves invalid serialized fields for strict schema
   assert.equal(Check(tool.parameters, prepareArguments(nestedString)), false);
   assert.equal(Check(tool.parameters, prepareArguments(oversized)), false);
   assert.equal(Check(tool.parameters, prepareArguments(extraTopLevel)), false);
+  assert.equal(Check(tool.parameters, prepareArguments(unknownCategory)), false);
   const nestedPrepared = prepareArguments(nestedProperty) as { nodes: Array<{ properties?: Record<string, unknown> }> };
   assert.equal(nestedPrepared.nodes[0]?.properties?.serialized, "[\"leave\",\"as text\"]");
   assert.equal(Check(tool.parameters, nestedPrepared), true);

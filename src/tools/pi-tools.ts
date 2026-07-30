@@ -186,6 +186,29 @@ const GraphDeltaSubmitParameters = Type.Object({
 }, { additionalProperties: false });
 type GraphDeltaSubmitParams = Static<typeof GraphDeltaSubmitParameters>;
 
+const ProjectorNodeGraphKindByType: Record<string, "reasoning" | "operation" | "task"> = {
+  Evidence: "reasoning",
+  Hypothesis: "reasoning",
+  Vulnerability: "reasoning",
+  Exploit: "reasoning",
+  Host: "operation",
+  Port: "operation",
+  Service: "operation",
+  WebEndpoint: "operation",
+  Parameter: "operation",
+  Credential: "operation",
+  AgentSession: "operation",
+  ShellSession: "operation",
+  Session: "operation",
+  File: "operation",
+  Process: "operation",
+  Goal: "task",
+  Task: "task",
+  Milestone: "task",
+  Blocker: "task",
+  Scope: "task"
+};
+
 const PlannerTaskIdSchema = Type.String({ pattern: "^task:.+", minLength: 6, maxLength: 256 });
 const PlannerNodeIdSchema = Type.String({ minLength: 1, maxLength: 256 });
 const PlannerRefArraySchema = Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 });
@@ -369,7 +392,7 @@ function prepareGraphDeltaSubmitArguments(args: unknown): GraphDeltaSubmitParams
   const input = args as Record<string, unknown>;
   return {
     ...input,
-    nodes: decodeSerializedArray(input.nodes),
+    nodes: normalizeProjectorNodeGraphKinds(decodeSerializedArray(input.nodes)),
     edges: decodeSerializedArray(input.edges)
   } as GraphDeltaSubmitParams;
 }
@@ -384,6 +407,29 @@ function decodeSerializedArray(value: unknown): unknown {
   } catch {
     return value;
   }
+}
+
+function normalizeProjectorNodeGraphKinds(value: unknown): unknown {
+  if (!Array.isArray(value) || value.length > 12) {
+    return value;
+  }
+  return value.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      return candidate;
+    }
+    const node = candidate as Record<string, unknown>;
+    const expectedGraphKind = typeof node.type === "string"
+      ? ProjectorNodeGraphKindByType[node.type]
+      : undefined;
+    const submittedGraphKind = typeof node.graphKind === "string" ? node.graphKind : undefined;
+    if (!expectedGraphKind
+      || !submittedGraphKind
+      || !["reasoning", "operation", "task"].includes(submittedGraphKind)
+      || submittedGraphKind === expectedGraphKind) {
+      return candidate;
+    }
+    return { ...node, graphKind: expectedGraphKind };
+  });
 }
 
 export function createGraphQueryTool(graphStore: SQLiteGraphStore) {
