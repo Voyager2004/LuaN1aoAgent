@@ -259,11 +259,12 @@ test("Linux Docker sandbox command forwards only approved environment and mounts
   assert.ok(command.some((value, index) => value === "--mount"
     && command[index + 1] === `type=bind,source=${sandboxRoot},target=${sandboxRoot},bind-propagation=rprivate`));
   assert.ok(command.some((value, index) => value === "--mount"
-    && command[index + 1] === `type=bind,source=${sandboxRoot}/tmp,target=/tmp,bind-propagation=rprivate`));
+    && command[index + 1] === `type=bind,source=${sandboxRoot}/tmp,target=/sandbox-tmp,bind-propagation=rprivate`));
   assert.ok(command.some((value, index) => value === "--mount"
     && command[index + 1] === `type=bind,source=${skillRoot},target=${skillRoot},readonly,bind-propagation=rprivate`));
-  assert.equal(command.some((value, index) => value === "--tmpfs"
-    && command[index + 1]?.startsWith("/tmp")), false);
+  assert.ok(command.some((value, index) => value === "--tmpfs"
+    && command[index + 1]?.startsWith("/tmp")));
+  assert.ok(command.some((value, index) => value === "--env" && command[index + 1] === "TMPDIR=/sandbox-tmp"));
   assert.ok(command.some((value, index) => value === "--env" && command[index + 1] === "HTTP_PROXY"));
   assert.ok(command.some((value, index) => value === "--env" && command[index + 1] === "HTTPS_PROXY"));
   assert.ok(command.some((value, index) => value === "--env" && command[index + 1] === "SSL_CERT_FILE"));

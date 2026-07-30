@@ -448,19 +448,21 @@ export function createDockerSandboxCommand(input: {
     "--memory",
     "1g",
     "--tmpfs",
+    "/tmp:rw,nosuid,nodev,noexec,size=128m",
+    "--tmpfs",
     "/run:rw,nosuid,nodev,noexec,size=16m",
     "--mount",
     `type=bind,source=${input.sandboxRoot},target=${input.sandboxRoot},bind-propagation=rprivate`,
     "--mount",
-    `type=bind,source=${join(input.sandboxRoot, "tmp")},target=/tmp,bind-propagation=rprivate`,
+    `type=bind,source=${join(input.sandboxRoot, "tmp")},target=/sandbox-tmp,bind-propagation=rprivate`,
     "--workdir",
     input.sandboxRoot,
     "--env",
     `HOME=${home}`,
     "--env",
-    "TMPDIR=/tmp",
+    "TMPDIR=/sandbox-tmp",
     "--env",
-    "TMPPREFIX=/tmp/zsh"
+    "TMPPREFIX=/sandbox-tmp/zsh"
   ];
   for (const root of dedupeNestedRoots(input.readOnlyRoots ?? [])) {
     argumentsList.push(
