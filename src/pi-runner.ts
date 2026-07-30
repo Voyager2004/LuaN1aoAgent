@@ -8,6 +8,18 @@ type SubscribableSession = {
   subscribe(listener: (event: unknown) => void): () => void;
   abort?: () => Promise<void>;
   clearQueue?: () => unknown;
+  /**
+   * AgentSession exposes dynamic tool selection as getActiveToolNames /
+   * setActiveToolsByName. Extension-backed adapters commonly surface the
+   * equivalent getActiveTools / setActiveTools pair instead. Structured
+   * recovery accepts either form. A recovery turn is rejected when neither
+   * form is available: without dynamic selection it cannot truthfully be
+   * terminal-only.
+   */
+  getActiveToolNames?: () => string[];
+  setActiveToolsByName?: (toolNames: string[]) => void;
+  getActiveTools?: () => string[];
+  setActiveTools?: (toolNames: string[]) => void;
 };
 
 export class StructuredInvocationError extends Error {
@@ -48,6 +60,9 @@ export async function invokeStructured<T>(
   let lastAssistantStopReason = "";
   let truncationSteersUsed = 0;
   let missingSubmitSteersUsed = 0;
+  let terminalOnlyRecoveryActive = false;
+  let activeToolsBeforeRecovery: string[] | undefined;
+  let restoreActiveTools: ((toolNames: string[]) => void) | undefined;
   let idleTimeout: NodeJS.Timeout | undefined;
   let hardTimeout: NodeJS.Timeout | undefined;
   let resolveInvocation: (value: T) => void = () => undefined;
@@ -69,6 +84,32 @@ export async function invokeStructured<T>(
       void session.abort?.();
     }
     rejectInvocation(error);
+  };
+  const enterTerminalOnlyRecovery = (): boolean => {
+    if (terminalOnlyRecoveryActive) {
+      return true;
+    }
+    const toolSelection = getToolSelection(session);
+    if (!toolSelection) {
+      rejectOnce(new StructuredInvocationError(
+        `Terminal-only recovery requires active tool controls for ${input.toolName}`,
+        "missing_submit"
+      ), true);
+      return false;
+    }
+    try {
+      activeToolsBeforeRecovery = [...toolSelection.getActiveToolNames()];
+      restoreActiveTools = toolSelection.setActiveToolsByName;
+      toolSelection.setActiveToolsByName([input.toolName]);
+      terminalOnlyRecoveryActive = true;
+      return true;
+    } catch (error) {
+      rejectOnce(new StructuredInvocationError(
+        `Unable to enter terminal-only recovery for ${input.toolName}: ${error instanceof Error ? error.message : String(error)}`,
+        "tool_error"
+      ));
+      return false;
+    }
   };
   const resetIdleTimeout = (): void => {
     if (!idleTimeoutMs || settled) {
@@ -102,6 +143,14 @@ export async function invokeStructured<T>(
     }
     if (event.type === "auto_retry_end" && event.success === true) {
       providerError = "";
+    }
+    // A real AgentSession has removed every other tool before this point. If
+    // an adapter still emits an ordinary tool event, it must not extend or
+    // satisfy the terminal recovery turn.
+    if (terminalOnlyRecoveryActive
+      && isToolExecutionEvent(event.type)
+      && event.toolName !== input.toolName) {
+      return;
     }
     if (isStructuredInvocationProgressEvent(event.type)) {
       resetIdleTimeout();
@@ -160,6 +209,9 @@ export async function invokeStructured<T>(
         // The model burned the whole completion budget (typically on reasoning)
         // before emitting the terminal tool call. Steer the same session into
         // submitting immediately instead of declaring a missing submit.
+        if (!enterTerminalOnlyRecovery()) {
+          return;
+        }
         truncationSteersUsed += 1;
         lastAssistantStopReason = "";
         resetIdleTimeout();
@@ -173,6 +225,9 @@ export async function invokeStructured<T>(
         // turn is safe because it permits only the already-required terminal
         // tool, and avoids converting useful execution into a synthetic
         // partial result solely due to formatting drift.
+        if (!enterTerminalOnlyRecovery()) {
+          return;
+        }
         missingSubmitSteersUsed += 1;
         lastAssistantStopReason = "";
         resetIdleTimeout();
@@ -211,6 +266,14 @@ export async function invokeStructured<T>(
       clearTimeout(hardTimeout);
     }
     unsubscribe();
+    if (terminalOnlyRecoveryActive && activeToolsBeforeRecovery && restoreActiveTools) {
+      try {
+        restoreActiveTools(activeToolsBeforeRecovery);
+      } catch {
+        // The result or timeout is already settled. A terminated session may
+        // reject a late restore, which must not replace that terminal outcome.
+      }
+    }
   }
 }
 
@@ -261,6 +324,27 @@ function isStructuredInvocationProgressEvent(eventType: unknown): boolean {
     "compaction_start",
     "compaction_end"
   ].includes(eventType);
+}
+
+function isToolExecutionEvent(eventType: unknown): boolean {
+  return eventType === "tool_execution_start"
+    || eventType === "tool_execution_update"
+    || eventType === "tool_execution_end";
+}
+
+function getToolSelection(session: SubscribableSession): {
+  getActiveToolNames: () => string[];
+  setActiveToolsByName: (toolNames: string[]) => void;
+} | undefined {
+  const getActiveTools = session.getActiveToolNames ?? session.getActiveTools;
+  const setActiveTools = session.setActiveToolsByName ?? session.setActiveTools;
+  if (!getActiveTools || !setActiveTools) {
+    return undefined;
+  }
+  return {
+    getActiveToolNames: () => getActiveTools.call(session),
+    setActiveToolsByName: (toolNames) => setActiveTools.call(session, toolNames)
+  };
 }
 
 function positiveTimeout(value: number | undefined): number | undefined {
@@ -354,6 +438,12 @@ export function attachExecutionLogging(input: {
   getTaskId?: () => string | undefined;
   getEpochId?: () => string | undefined;
   getAbortContext?: () => RuntimeAbortContext | undefined;
+  /**
+   * Synchronous admission gate for a new model turn. Pi emits turn_start
+   * before issuing the provider request, so returning false prevents the
+   * request rather than merely noticing it after turn_usage is recorded.
+   */
+  onTurnStart?: (input: { role: AgentRole; taskId?: string; epochId?: string }) => boolean;
   spillThreshold?: number;
   onPersistedEvent?: (event: ExecutionEvent) => void | Promise<void>;
 }): (() => void) & { drain: () => Promise<void> } {
@@ -363,6 +453,21 @@ export function attachExecutionLogging(input: {
   const unsubscribe = input.session.subscribe((event) => {
     const typedEvent = event as { type?: string; toolName?: string; isError?: boolean };
     const eventType = typedEvent.type ?? "unknown";
+    if (eventType === "turn_start") {
+      const taskId = input.getTaskId?.();
+      const epochId = input.getEpochId?.();
+      let admitted = false;
+      try {
+        admitted = input.onTurnStart?.({ role: input.role, taskId, epochId }) ?? true;
+      } catch {
+        admitted = false;
+      }
+      if (!admitted) {
+        input.session.clearQueue?.();
+        void input.session.abort?.();
+        return;
+      }
+    }
     if (!shouldPersistEvent(eventType)) {
       return;
     }
@@ -418,6 +523,7 @@ export function attachExecutionLogging(input: {
 
 function shouldPersistEvent(eventType: string): boolean {
   return [
+    "turn_start",
     "tool_execution_start",
     "tool_execution_end",
     "turn_end",
@@ -433,6 +539,13 @@ function normalizePiEvent(
 ): { eventType: string; summary: string; payload: JsonObject } | undefined {
   const eventType = String(event.type ?? "unknown");
   const classification = classifyPiEvent(event, abortContext);
+  if (eventType === "turn_start") {
+    return {
+      eventType: "llm_turn_started",
+      summary: "llm_turn_started",
+      payload: {}
+    };
+  }
   if (eventType === "auto_retry_start") {
     return {
       eventType: "provider_retry_started",

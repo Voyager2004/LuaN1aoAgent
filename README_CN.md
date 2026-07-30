@@ -287,6 +287,7 @@ npm start -- \
   --goal "在授权范围内评估 http://127.0.0.1:8080" \
   --scope "仅限 http://127.0.0.1:8080" \
   --max-cycles 8 \
+  --max-llm-turns 100 \
   --max-parallel-tasks 2
 ```
 
@@ -309,6 +310,7 @@ npm start -- --resume 20260720-080000Z-a1b2c3d4
 --runtime-dir <path>         新运行使用的空目录
 --resume <session>           恢复一个运行，同时恢复 Goal 与 Scope
 --max-cycles <number>        Planner 最大循环数
+--max-llm-turns <number>     全部角色合计的 LLM 最大交互轮数
 --max-parallel-tasks <n>     最大并行任务数
 --max-run-time-ms <number>   全局运行超时，单位毫秒
 --json                       禁用 TUI，输出最终 JSON

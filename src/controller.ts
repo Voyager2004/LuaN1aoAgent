@@ -253,6 +253,9 @@ type RunResult = {
   cycles: Array<Awaited<ReturnType<SecurityAgentController["runOnce"]>>>;
   completed: boolean;
   stoppedReason: string;
+  maxLlmTurns?: number;
+  llmTurnsUsed?: number;
+  remainingLlmTurns?: number;
 };
 
 type ActiveRunRecord = {
@@ -261,6 +264,9 @@ type ActiveRunRecord = {
   maxRunTimeMs: number;
   deadlineAt: number;
   startSeq: number;
+  maxLlmTurns?: number;
+  llmTurnsStarted: number;
+  llmTurnBudgetStopRequested: boolean;
   outcome?: RunResult | { completed: false; stoppedReason: string; failed: true };
 };
 
@@ -483,10 +489,12 @@ export class SecurityAgentController {
     maxPlannerCycles?: number;
     maxParallelTasks?: number;
     maxRunTimeMs?: number;
+    maxLlmTurns?: number;
   }): Promise<RunResult> {
     const maxPlannerCycles = input.maxPlannerCycles ?? 8;
     const maxParallelTasks = normalizeParallelTaskLimit(input.maxParallelTasks);
     const maxRunTimeMs = normalizeRunTimeBudgetMs(input.maxRunTimeMs);
+    const maxLlmTurns = normalizeGlobalLlmTurnLimit(input.maxLlmTurns);
     const cycles: Array<Awaited<ReturnType<SecurityAgentController["runOnce"]>>> = [];
     const invocationId = `run:${randomUUID()}`;
     const startedAt = Date.now();
@@ -503,6 +511,7 @@ export class SecurityAgentController {
         maxPlannerCycles,
         maxParallelTasks,
         maxRunTimeMs,
+        maxLlmTurns,
         deadlineAt: new Date(deadlineAt).toISOString(),
         structuredInvocationsEnabled: this.structuredInvocationsEnabled,
         runtimeDir: this.runtimeDir,
@@ -543,11 +552,21 @@ export class SecurityAgentController {
       startedAt,
       maxRunTimeMs,
       deadlineAt,
-      startSeq: runStartedEvent.seq ?? 0
+      startSeq: runStartedEvent.seq ?? 0,
+      maxLlmTurns,
+      llmTurnsStarted: 0,
+      llmTurnBudgetStopRequested: false
     };
     const decideRun = async (result: RunResult): Promise<RunResult> => {
+      const activeRun = this.activeRun?.invocationId === invocationId ? this.activeRun : undefined;
+      const runResult = {
+        ...result,
+        maxLlmTurns: activeRun?.maxLlmTurns,
+        llmTurnsUsed: activeRun?.llmTurnsStarted ?? 0,
+        remainingLlmTurns: remainingLlmTurns(activeRun)
+      };
       if (this.activeRun?.invocationId === invocationId) {
-        this.activeRun.outcome = result;
+        this.activeRun.outcome = runResult;
       }
       await this.executionLog.append({
         role: "runtime",
@@ -555,13 +574,16 @@ export class SecurityAgentController {
         summary: result.stoppedReason,
         payload: {
           invocationId,
-          completed: result.completed,
-          stoppedReason: result.stoppedReason,
-          plannerCycleCount: result.cycles.length,
+          completed: runResult.completed,
+          stoppedReason: runResult.stoppedReason,
+          plannerCycleCount: runResult.cycles.length,
+          maxLlmTurns: runResult.maxLlmTurns,
+          llmTurnsUsed: runResult.llmTurnsUsed,
+          remainingLlmTurns: runResult.remainingLlmTurns,
           durationMs: Date.now() - startedAt
         }
       });
-      return result;
+      return runResult;
     };
     try {
       let cycleIndex = 0;
@@ -569,6 +591,13 @@ export class SecurityAgentController {
       while (cycleIndex < maxPlannerCycles) {
         if (this.stopRequestedReason) {
           return await decideRun({ cycles, completed: false, stoppedReason: this.stopRequestedReason });
+        }
+        if (this.isGlobalLlmTurnBudgetExhausted()) {
+          return await decideRun({
+            cycles,
+            completed: false,
+            stoppedReason: this.globalLlmTurnBudgetStopReason()
+          });
         }
         if (Date.now() >= deadlineAt) {
           return await decideRun({
@@ -583,6 +612,13 @@ export class SecurityAgentController {
         } catch (error) {
           if (this.stopRequestedReason) {
             return await decideRun({ cycles, completed: false, stoppedReason: this.stopRequestedReason });
+          }
+          if (this.isGlobalLlmTurnBudgetExhausted()) {
+            return await decideRun({
+              cycles,
+              completed: false,
+              stoppedReason: this.globalLlmTurnBudgetStopReason()
+            });
           }
           if (Date.now() >= deadlineAt) {
             return await decideRun({
@@ -633,6 +669,13 @@ export class SecurityAgentController {
         if (this.isRootGoalStatus("blocked")) {
           return await decideRun({ cycles, completed: false, stoppedReason: cycleResult.plannerDecision.reason });
         }
+        if (this.isGlobalLlmTurnBudgetExhausted()) {
+          return await decideRun({
+            cycles,
+            completed: false,
+            stoppedReason: this.globalLlmTurnBudgetStopReason()
+          });
+        }
       }
       return await decideRun({
         cycles,
@@ -651,7 +694,14 @@ export class SecurityAgentController {
         role: "runtime",
         eventType: "run_failed",
         summary: stoppedReason,
-        payload: { invocationId, durationMs: Date.now() - startedAt, error: stoppedReason }
+        payload: {
+          invocationId,
+          durationMs: Date.now() - startedAt,
+          error: stoppedReason,
+          maxLlmTurns: this.activeRun?.maxLlmTurns,
+          llmTurnsUsed: this.activeRun?.llmTurnsStarted ?? 0,
+          remainingLlmTurns: remainingLlmTurns(this.activeRun)
+        }
       });
       throw error;
     }
@@ -711,6 +761,9 @@ export class SecurityAgentController {
         completed: activeRun.outcome?.completed ?? false,
         stoppedReason: activeRun.outcome?.stoppedReason ?? "Controller closed without a run outcome",
         durationMs: Date.now() - activeRun.startedAt,
+        maxLlmTurns: activeRun.maxLlmTurns,
+        llmTurnsUsed: activeRun.llmTurnsStarted,
+        remainingLlmTurns: remainingLlmTurns(activeRun),
         costCurrency: this.llmRuntime.metadata.costCurrency,
         eventMetrics,
         runtimeMetrics: this.runtimeStore.stats(),
@@ -1257,19 +1310,20 @@ export class SecurityAgentController {
       const executorStatsBefore = readPiSessionStats(executorSession.session);
       state.executorSession = executorSession.session;
       state.dynamicExecutor = executorSession.dynamicExecutor;
-      let executorLogging: ReturnType<typeof attachExecutionLogging> | undefined;
-      if (executorSession.dynamicExecutor) {
-        executorLogging = attachExecutionLogging({
-          session: executorSession.session,
-          executionLog: this.executionLog,
-          artifactStore: this.artifactStore,
-          role: "executor",
-          getTaskId: () => taskEnvelope.taskId,
-          getEpochId: () => state.epochId,
-          getAbortContext: () => state.abortContext,
-          onPersistedEvent: (event) => this.handleExecutorEventPersisted(event)
-        });
-      }
+      // Attach the turn gate even for legacy/shared sessions. Production uses
+      // dynamic sessions, but a global budget must remain effective whenever
+      // the controller is configured differently.
+      const executorLogging = attachExecutionLogging({
+        session: executorSession.session,
+        executionLog: this.executionLog,
+        artifactStore: this.artifactStore,
+        role: "executor",
+        getTaskId: () => taskEnvelope.taskId,
+        getEpochId: () => state.epochId,
+        getAbortContext: () => state.abortContext,
+        onTurnStart: () => this.tryAcquireGlobalLlmTurn(),
+        onPersistedEvent: (event) => this.handleExecutorEventPersisted(event)
+      });
       this.armEpochTimeSlice(taskEnvelope);
       const taskStartedEvent = await this.executionLog.append({
         epochId: state.epochId,
@@ -1324,7 +1378,7 @@ export class SecurityAgentController {
         }
       } catch (error) {
         executorError = error;
-        providerFailure = state.executorStopRequested
+        providerFailure = state.executorStopRequested || this.isGlobalLlmTurnBudgetExhausted()
           ? undefined
           : classifyExecutorProviderFailure(error, error, executorOutput);
         executorInvocationStatus = providerFailure?.retryable ? "provider_error" : "failed";
@@ -1675,14 +1729,13 @@ export class SecurityAgentController {
         const plannerSession = plannerSessionResult.session;
         this.activePlannerSessions.add(plannerSession);
         plannerStatsBefore = readPiSessionStats(plannerSession);
-        plannerLogging = plannerSessionResult.isolated
-          ? attachExecutionLogging({
-            session: plannerSession,
-            executionLog: this.executionLog,
-            artifactStore: this.artifactStore,
-            role: "planner"
-          })
-          : undefined;
+        plannerLogging = attachExecutionLogging({
+          session: plannerSession,
+          executionLog: this.executionLog,
+          artifactStore: this.artifactStore,
+          role: "planner",
+          onTurnStart: () => this.tryAcquireGlobalLlmTurn()
+        });
         const plannerDecision = this.structuredInvocationsEnabled
           ? await invokeStructured(plannerSession, plannerInput, {
             toolName: "planner_submit",
@@ -1707,6 +1760,10 @@ export class SecurityAgentController {
             summary: this.stopRequestedReason,
             payload: { plannerPromptId, attempt, maxAttempts: PLANNER_FRESH_SESSION_ATTEMPTS }
           });
+          throw error;
+        }
+        if (this.isGlobalLlmTurnBudgetExhausted()) {
+          plannerInvocationStatus = "aborted";
           throw error;
         }
         const providerFailure = classifyPlannerProviderFailure(error);
@@ -1793,6 +1850,48 @@ export class SecurityAgentController {
     return Math.max(0, Math.min(configuredLimitMs, this.activeRun.deadlineAt - Date.now()));
   }
 
+  /**
+   * Admit one provider-bound model turn. This runs from Pi's turn_start
+   * callback, before the provider request begins, so one shared counter is
+   * sufficient even while several task roles are active concurrently.
+   */
+  private tryAcquireGlobalLlmTurn(): boolean {
+    const activeRun = this.activeRun;
+    if (!activeRun || activeRun.maxLlmTurns === undefined) {
+      return true;
+    }
+    if (activeRun.llmTurnsStarted < activeRun.maxLlmTurns) {
+      activeRun.llmTurnsStarted += 1;
+      return true;
+    }
+    if (!activeRun.llmTurnBudgetStopRequested) {
+      activeRun.llmTurnBudgetStopRequested = true;
+      const reason = this.globalLlmTurnBudgetStopReason(activeRun);
+      void this.executionLog.append({
+        role: "runtime",
+        eventType: "llm_turn_budget_exhausted",
+        summary: reason,
+        payload: {
+          invocationId: activeRun.invocationId,
+          maxLlmTurns: activeRun.maxLlmTurns,
+          llmTurnsUsed: activeRun.llmTurnsStarted,
+          remainingLlmTurns: 0
+        }
+      }).catch(() => undefined);
+    }
+    return false;
+  }
+
+  private isGlobalLlmTurnBudgetExhausted(): boolean {
+    const activeRun = this.activeRun;
+    return activeRun?.maxLlmTurns !== undefined
+      && activeRun.llmTurnsStarted >= activeRun.maxLlmTurns;
+  }
+
+  private globalLlmTurnBudgetStopReason(activeRun = this.activeRun): string {
+    return `Reached global LLM turn budget: ${activeRun?.maxLlmTurns ?? 0}`;
+  }
+
   private async createPlannerSessionForCycle(forceIsolated = false): Promise<{ session: SecurityAgentSession; isolated: boolean }> {
     if (!this.isolatedSessionsEnabled && !forceIsolated) {
       return { session: this.requireAgents().planner, isolated: false };
@@ -1826,7 +1925,9 @@ export class SecurityAgentController {
       executionLog: this.executionLog,
       artifactStore: this.artifactStore,
       role: "observer",
-      getTaskId: () => taskId
+      getTaskId: () => taskId,
+      getEpochId: () => this.getActiveTaskState(taskId)?.epochId,
+      onTurnStart: () => this.tryAcquireGlobalLlmTurn()
     });
     return { session: observer.session, dynamicObserver: true, logging };
   }
@@ -3589,19 +3690,21 @@ export class SecurityAgentController {
       ]
     })).events;
     const observations = buildProjectionObservations(recentEvents);
-    const observationSummary = causalObservationDigest(observations, 6_000);
-    const previousResultSummary = stringProperty(this.getTaskStatusSnapshot(input.taskEnvelope.taskId)?.resultSummary);
+    const observationSummary = causalObservationDigest(observations, 1_800);
+    const previousResultSummary = compactSyntheticTaskResultHistory(
+      stringProperty(this.getTaskStatusSnapshot(input.taskEnvelope.taskId)?.resultSummary)
+    );
     const artifactRefs = dedupeStrings(observations.flatMap((observation) => observation.artifactRefs));
     const isInfraAbort = state?.abortContext?.kind === "budget_abort"
       || (!signal && /concurrency limit|rate limit|too many requests|\b429\b|\b5\d\d\b|bad gateway|service unavailable|timed out|timeout/i.test(input.reason));
     const summary = [
       observationSummary ? `本轮因果观察：\n${observationSummary}` : undefined,
-      previousResultSummary ? `既有阶段结果：${truncateText(previousResultSummary, 800)}` : undefined,
+      previousResultSummary ? `既有阶段结果：${previousResultSummary}` : undefined,
       signal
-        ? `Executor checkpointed by Observer/Controller: ${signal.reason}`
-        : `Executor ended without valid TaskResult: ${input.reason}`,
-      input.executorOutputPreview.trim().length > 0
-        ? `Executor 输出：${truncateText(input.executorOutputPreview, 800)}`
+        ? `Executor checkpointed by Observer/Controller: ${truncateText(signal.reason, 320)}`
+        : `Executor ended without valid TaskResult: ${truncateText(input.reason, 320)}`,
+      !observationSummary && input.executorOutputPreview.trim().length > 0
+        ? `Executor 输出：${truncateText(input.executorOutputPreview, 320)}`
         : undefined
     ].filter((line): line is string => Boolean(line)).join("\n");
     return {
@@ -3805,6 +3908,22 @@ function normalizeRunTimeBudgetMs(value: unknown): number {
     return DEFAULT_RUN_TIME_BUDGET_MS;
   }
   return Math.max(60_000, Math.floor(value));
+}
+
+function normalizeGlobalLlmTurnLimit(value: unknown): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`maxLlmTurns must be a positive integer: ${String(value)}`);
+  }
+  return value;
+}
+
+function remainingLlmTurns(activeRun?: ActiveRunRecord): number | undefined {
+  return activeRun?.maxLlmTurns === undefined
+    ? undefined
+    : Math.max(0, activeRun.maxLlmTurns - activeRun.llmTurnsStarted);
 }
 
 function normalizeGraphDelta(delta: Partial<GraphDelta>): GraphDelta {
@@ -4289,6 +4408,33 @@ function truncateText(value: string, limit: number): string {
     return normalized;
   }
   return `${normalized.slice(0, Math.max(0, limit - 24))}...[truncated:${normalized.length}]`;
+}
+
+/**
+ * A missing executor terminal submission is recovered from runtime evidence.
+ * Preserve only a small, distinct tail of earlier progress so repeated recovery
+ * cycles cannot recursively re-embed whole TaskResult summaries in later input.
+ */
+function compactSyntheticTaskResultHistory(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const seen = new Set<string>();
+  const fragments = value
+    .replace(/(?:本轮因果观察|既有阶段结果|上一阶段结果|Executor 输出)\s*[:：]\s*/g, "\n")
+    .split(/\n+/)
+    .map((fragment) => fragment.replace(/\s+/g, " ").trim())
+    .filter((fragment) => fragment.length > 0)
+    .filter((fragment) => {
+      const key = fragment.toLocaleLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .slice(-4);
+  return fragments.length > 0 ? truncateText(fragments.join(" | "), 320) : undefined;
 }
 
 function truncateOneLine(value: string, limit: number): string {

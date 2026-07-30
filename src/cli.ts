@@ -86,6 +86,7 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
       userGoal: runContext.userGoal,
       scopeSummary: runContext.scopeSummary,
       maxPlannerCycles: options.maxPlannerCycles,
+      maxLlmTurns: options.maxLlmTurns,
       maxParallelTasks: options.maxParallelTasks,
       maxRunTimeMs: options.maxRunTimeMs
     });

@@ -1105,9 +1105,11 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
     const maxRunTimeMs = optionalPositiveNumber(body.maxRunTimeMs);
     const maxParallelTasks = optionalPositiveNumber(body.maxParallelTasks);
     const maxPlannerCycles = optionalPositiveNumber(body.maxPlannerCycles);
+    const maxLlmTurns = optionalPositiveInteger(body.maxLlmTurns);
     if (maxRunTimeMs !== undefined) options.maxRunTimeMs = maxRunTimeMs;
     if (maxParallelTasks !== undefined) options.maxParallelTasks = maxParallelTasks;
     if (maxPlannerCycles !== undefined) options.maxPlannerCycles = maxPlannerCycles;
+    if (maxLlmTurns !== undefined) options.maxLlmTurns = maxLlmTurns;
 
     const activeRun = run;
     activeRun.completion = controller.runUntilDone(options)
@@ -1226,6 +1228,10 @@ function redactCredentialRefs(value: unknown): unknown {
 
 function optionalPositiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function optionalPositiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 async function readRuntimeState(runtimeDirInput: string): Promise<JsonRecord> {

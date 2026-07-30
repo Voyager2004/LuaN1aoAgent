@@ -4,6 +4,7 @@ export type CliOptions = {
   runtimeDir?: string;
   resumeDir?: string;
   maxPlannerCycles?: number;
+  maxLlmTurns?: number;
   maxParallelTasks?: number;
   maxRunTimeMs?: number;
   json: boolean;
@@ -22,6 +23,7 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     "runtime-dir",
     "resume",
     "max-cycles",
+    "max-llm-turns",
     "max-parallel-tasks",
     "max-run-time-ms"
   ]);
@@ -63,6 +65,7 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     runtimeDir: values.get("runtime-dir"),
     resumeDir: values.get("resume"),
     maxPlannerCycles: optionalNumber(values, "max-cycles"),
+    maxLlmTurns: optionalPositiveInteger(values, "max-llm-turns"),
     maxParallelTasks: optionalNumber(values, "max-parallel-tasks"),
     maxRunTimeMs: optionalNumber(values, "max-run-time-ms"),
     json: flags.has("json"),
@@ -87,6 +90,7 @@ export function cliHelp(): string {
     "  --runtime-dir <path>         New runtime directory; must be empty",
     "  --resume <session>           Resume one runtime; do not pass --goal",
     "  --max-cycles <number>        Maximum Planner cycles",
+    "  --max-llm-turns <number>     Global maximum LLM turns across all roles",
     "  --max-parallel-tasks <n>     Maximum concurrent tasks",
     "  --max-run-time-ms <number>   Run timeout in milliseconds",
     "  --json                       Disable TUI and print final JSON",
@@ -111,6 +115,18 @@ function optionalNumber(values: Map<string, string>, key: string): number | unde
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
     throw new Error(`Invalid number for --${key}: ${value}`);
+  }
+  return parsed;
+}
+
+function optionalPositiveInteger(values: Map<string, string>, key: string): number | undefined {
+  const value = values.get(key);
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid positive integer for --${key}: ${value}`);
   }
   return parsed;
 }

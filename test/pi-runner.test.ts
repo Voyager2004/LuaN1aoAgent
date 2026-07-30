@@ -202,6 +202,8 @@ test("fails with a protocol error when terminal submit is missing", async () => 
 test("repairs a normally completed response that omitted its terminal submit", async () => {
   const listeners: Array<(event: unknown) => void> = [];
   const prompts: string[] = [];
+  const toolSets: string[][] = [];
+  let activeTools = ["bash", "task_result_submit"];
   const session = {
     async prompt(text: string): Promise<void> {
       prompts.push(text);
@@ -222,6 +224,13 @@ test("repairs a normally completed response that omitted its terminal submit", a
     subscribe(listener: (event: unknown) => void): () => void {
       listeners.push(listener);
       return () => undefined;
+    },
+    getActiveToolNames(): string[] {
+      return [...activeTools];
+    },
+    setActiveToolsByName(toolNames: string[]): void {
+      toolSets.push([...toolNames]);
+      activeTools = [...toolNames];
     }
   };
 
@@ -232,11 +241,149 @@ test("repairs a normally completed response that omitted its terminal submit", a
   assert.equal(prompts.length, 2);
   assert.match(prompts[1] ?? "", /协议恢复/);
   assert.match(prompts[1] ?? "", /task_result_submit/);
+  assert.deepEqual(toolSets, [["task_result_submit"], ["bash", "task_result_submit"]]);
+});
+
+test("fails closed when terminal-only recovery cannot restrict the active tools", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  let promptCount = 0;
+  const session = {
+    async prompt(): Promise<void> {
+      promptCount += 1;
+      emitToListeners(listeners, {
+        type: "message_end",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "checkpoint ready" }] }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    }
+  };
+
+  await assert.rejects(
+    () => invokeStructured(session, "test", {
+      toolName: "task_result_submit",
+      maxMissingSubmitSteers: 1
+    }),
+    /Terminal-only recovery requires active tool controls/
+  );
+  assert.equal(promptCount, 1);
+});
+
+test("restricts protocol recovery to the terminal tool and ignores a rejected ordinary tool", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  const prompts: string[] = [];
+  const toolSets: string[][] = [];
+  const attemptedTools: string[] = [];
+  const rejectedTools: string[] = [];
+  const executedTools: string[] = [];
+  let activeTools = ["bash", "task_result_submit"];
+  const attemptTool = (toolName: string): void => {
+    attemptedTools.push(toolName);
+    if (!activeTools.includes(toolName)) {
+      rejectedTools.push(toolName);
+      emitToListeners(listeners, { type: "tool_execution_start", toolName });
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName,
+        isError: true,
+        result: { content: [{ type: "text", text: `${toolName} is not active for protocol recovery` }] }
+      });
+      return;
+    }
+    executedTools.push(toolName);
+    emitToListeners(listeners, {
+      type: "tool_execution_end",
+      toolName,
+      isError: false,
+      result: { details: { status: "partial", summary: "submitted after isolated recovery" } }
+    });
+  };
+  const session = {
+    async prompt(text: string): Promise<void> {
+      prompts.push(text);
+      if (prompts.length === 1) {
+        emitToListeners(listeners, {
+          type: "message_end",
+          message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "checkpoint ready" }] }
+        });
+        return;
+      }
+      attemptTool("bash");
+      attemptTool("task_result_submit");
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    getActiveToolNames(): string[] {
+      return [...activeTools];
+    },
+    setActiveToolsByName(toolNames: string[]): void {
+      toolSets.push([...toolNames]);
+      activeTools = [...toolNames];
+    }
+  };
+
+  assert.deepEqual(await invokeStructured(session, "test", {
+    toolName: "task_result_submit",
+    maxMissingSubmitSteers: 1
+  }), { status: "partial", summary: "submitted after isolated recovery" });
+  assert.deepEqual(attemptedTools, ["bash", "task_result_submit"]);
+  assert.deepEqual(rejectedTools, ["bash"]);
+  assert.deepEqual(executedTools, ["task_result_submit"]);
+  assert.deepEqual(toolSets, [["task_result_submit"], ["bash", "task_result_submit"]]);
+  assert.deepEqual(activeTools, ["bash", "task_result_submit"]);
+});
+
+test("supports extension-style active tool controls for terminal-only recovery", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  const toolSets: string[][] = [];
+  let promptCount = 0;
+  let activeTools = ["graph_query", "planner_submit"];
+  const session = {
+    async prompt(): Promise<void> {
+      promptCount += 1;
+      if (promptCount === 1) {
+        emitToListeners(listeners, {
+          type: "message_end",
+          message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ready" }] }
+        });
+        return;
+      }
+      assert.deepEqual(activeTools, ["planner_submit"]);
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName: "planner_submit",
+        isError: false,
+        result: { details: { decision: "apply_commands", reason: "recovered" } }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    getActiveTools(): string[] {
+      return [...activeTools];
+    },
+    setActiveTools(toolNames: string[]): void {
+      toolSets.push([...toolNames]);
+      activeTools = [...toolNames];
+    }
+  };
+
+  assert.deepEqual(await invokeStructured(session, "test", {
+    toolName: "planner_submit",
+    maxMissingSubmitSteers: 1
+  }), { decision: "apply_commands", reason: "recovered" });
+  assert.deepEqual(toolSets, [["planner_submit"], ["graph_query", "planner_submit"]]);
 });
 
 test("steers the session into submitting when the response is truncated at the token limit", async () => {
   const listeners: Array<(event: unknown) => void> = [];
   const prompts: string[] = [];
+  let activeTools = ["bash", "planner_submit"];
   const session = {
     async prompt(text: string): Promise<void> {
       prompts.push(text);
@@ -261,6 +408,12 @@ test("steers the session into submitting when the response is truncated at the t
     subscribe(listener: (event: unknown) => void): () => void {
       listeners.push(listener);
       return () => undefined;
+    },
+    getActiveToolNames(): string[] {
+      return [...activeTools];
+    },
+    setActiveToolsByName(toolNames: string[]): void {
+      activeTools = [...toolNames];
     }
   };
 
@@ -277,6 +430,7 @@ test("steers the session into submitting when the response is truncated at the t
 test("reports missing_submit after truncation steers are exhausted", async () => {
   const listeners: Array<(event: unknown) => void> = [];
   let promptCount = 0;
+  let activeTools = ["bash", "planner_submit"];
   const session = {
     async prompt(): Promise<void> {
       promptCount += 1;
@@ -288,6 +442,12 @@ test("reports missing_submit after truncation steers are exhausted", async () =>
     subscribe(listener: (event: unknown) => void): () => void {
       listeners.push(listener);
       return () => undefined;
+    },
+    getActiveToolNames(): string[] {
+      return [...activeTools];
+    },
+    setActiveToolsByName(toolNames: string[]): void {
+      activeTools = [...toolNames];
     }
   };
 
@@ -903,6 +1063,45 @@ test("records Pi native provider retry lifecycle events", async () => {
     "provider_retry_completed"
   ]);
   assert.equal(events[1]?.payload.success, true);
+});
+
+test("gates a turn before logging or issuing the next provider request", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runner-"));
+  const listeners: Array<(event: unknown) => void> = [];
+  const executionLog = new ExecutionLog(join(runtimeDir, "execution.jsonl"));
+  let allowTurn = true;
+  let clearQueueCount = 0;
+  let abortCount = 0;
+  const session = {
+    async prompt(): Promise<void> {},
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    clearQueue(): void {
+      clearQueueCount += 1;
+    },
+    async abort(): Promise<void> {
+      abortCount += 1;
+    }
+  };
+  const logging = attachExecutionLogging({
+    session,
+    executionLog,
+    role: "planner",
+    onTurnStart: () => allowTurn
+  });
+
+  emitToListeners(listeners, { type: "turn_start" });
+  await logging.drain();
+  assert.deepEqual((await executionLog.readAll()).map((event) => event.eventType), ["llm_turn_started"]);
+
+  allowTurn = false;
+  emitToListeners(listeners, { type: "turn_start" });
+  await logging.drain();
+  assert.equal(clearQueueCount, 1);
+  assert.equal(abortCount, 1);
+  assert.deepEqual((await executionLog.readAll()).map((event) => event.eventType), ["llm_turn_started"]);
 });
 
 function createMockSession(): {

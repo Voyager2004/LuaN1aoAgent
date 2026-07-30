@@ -555,6 +555,35 @@ test("synthetic TaskResult preserves a middle-epoch breakthrough after later noi
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
+test("synthetic TaskResult compacts repeated historical partial summaries", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({ taskId: "task:bounded-history" });
+  harness.controller.graphStore.createTask({ ...taskEnvelope, priority: 1 });
+  const repeatedFinding = "已确认会话上下文可复用";
+  const retainedFinding = "下一阶段只需核对订单回执";
+  const nestedHistory = Array.from({ length: 18 }, () => (
+    `本轮因果观察：${repeatedFinding}\n既有阶段结果：${repeatedFinding}`
+  )).join("\n");
+  harness.controller.graphStore.markTaskStatus({
+    taskId: taskEnvelope.taskId,
+    status: "partial",
+    properties: {
+      resultSummary: `${nestedHistory}\nExecutor 输出：${retainedFinding}`
+    }
+  });
+
+  const taskResult = await harness.controllerHarness.createSyntheticTaskResult({
+    taskEnvelope,
+    reason: "terminal submission was not returned",
+    executorOutputPreview: ""
+  });
+
+  assert.ok(taskResult.summary.length <= 800);
+  assert.equal((taskResult.summary.match(new RegExp(repeatedFinding, "g")) ?? []).length, 1);
+  assert.match(taskResult.summary, new RegExp(retainedFinding));
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("runtime grounds submitted TaskResult with current epoch observations and artifacts", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope();
@@ -4123,6 +4152,190 @@ test("runUntilDone continues planning after task graph command cycles", async ()
   assert.equal(runCompleted.payload.stoppedReason, "Reached max planner cycles: 2");
 });
 
+test("global LLM turn budget is shared across planner and executor sessions", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  const planner = createTurnAwareMockTextSession(JSON.stringify({
+    decision: "apply_commands",
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:global-turn-budget",
+        goal: "Run the next task phase",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        constraints: [],
+        successCriteria: ["phase complete"],
+        budget: { maxTurns: 10 },
+        priority: 1
+      }],
+      reason: "Start the task phase.",
+      basedOnRefs: ["goal:root"]
+    }],
+    reason: "Start the task phase.",
+    basedOnRefs: ["goal:root"]
+  }));
+  const executor = createTurnAwareMockTextSession(JSON.stringify({
+    taskId: "task:global-turn-budget",
+    status: "completed",
+    summary: "should not run after the shared turn limit",
+    evidenceRefs: [],
+    artifactRefs: []
+  }));
+  controllerHarness.agents = {
+    planner,
+    executor,
+    observer: createAbortableMockTextSession(observerProjectionJson())
+  };
+
+  const result = await controller.runUntilDone({
+    userGoal: "Stop after one model turn",
+    scopeSummary: "Authorized target only",
+    maxPlannerCycles: 4,
+    maxLlmTurns: 1
+  });
+
+  assert.equal(result.completed, false);
+  assert.equal(result.stoppedReason, "Reached global LLM turn budget: 1");
+  assert.equal(result.llmTurnsUsed, 1);
+  assert.equal(result.remainingLlmTurns, 0);
+  assert.equal(planner.promptCount(), 1);
+  assert.equal(executor.promptCount(), 1);
+  const events = await controller.executionLog.readAll();
+  assert.deepEqual(
+    events.filter((event) => event.eventType === "llm_turn_started").map((event) => event.role),
+    ["planner"]
+  );
+  assert.ok(events.some((event) => event.eventType === "llm_turn_budget_exhausted"));
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("global LLM turn budget preserves an admitted concurrent executor turn", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  const executorSessions = new Map<string, ReturnType<typeof createTurnAwareDelayedMockTextSession>>();
+  controllerHarness.agents = {
+    planner: createTurnAwareMockTextSession(JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "create_tasks",
+        tasks: [
+          {
+            id: "task:budget-a",
+            goal: "Complete parallel phase A",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: [],
+            successCriteria: ["phase A complete"],
+            budget: { maxTurns: 10 },
+            priority: 1
+          },
+          {
+            id: "task:budget-b",
+            goal: "Complete parallel phase B",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: [],
+            successCriteria: ["phase B complete"],
+            budget: { maxTurns: 10 },
+            priority: 1
+          }
+        ],
+        reason: "Run the independent phases together.",
+        basedOnRefs: ["goal:root"]
+      }],
+      reason: "Run the independent phases together.",
+      basedOnRefs: ["goal:root"]
+    })),
+    executor: createAbortableMockTextSession("{}"),
+    observer: createAbortableMockTextSession(observerProjectionJson())
+  };
+  controllerHarness.createExecutorSessionForTask = async (taskEnvelope, useDynamicExecutor) => {
+    const session = createTurnAwareDelayedMockTextSession(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return JSON.stringify({
+        taskId: taskEnvelope.taskId,
+        status: "completed",
+        summary: `${taskEnvelope.taskId} completed`,
+        evidenceRefs: [],
+        artifactRefs: []
+      });
+    });
+    executorSessions.set(taskEnvelope.taskId, session);
+    return { session, dynamicExecutor: useDynamicExecutor, resumed: false, resumeCount: 0 };
+  };
+  controllerHarness.enqueueProjectionJob = async () => ({
+    graphDelta: { sourceEventIds: [], nodes: [], edges: [] },
+    controlSignal: { decision: "continue", reason: "test projection", evidenceRefs: [], confidence: "low" }
+  });
+
+  const result = await controller.runUntilDone({
+    userGoal: "Complete independent phases",
+    scopeSummary: "Authorized target only",
+    maxPlannerCycles: 1,
+    maxParallelTasks: 2,
+    maxLlmTurns: 2
+  });
+
+  assert.equal(result.stoppedReason, "Reached global LLM turn budget: 2");
+  assert.equal(result.llmTurnsUsed, 2);
+  assert.equal(executorSessions.size, 2);
+  const sessions = [...executorSessions.values()];
+  assert.equal(sessions.filter((session) => session.responseWasAborted() === false).length, 1);
+  assert.equal(sessions.filter((session) => session.responseWasAborted() === true).length, 1);
+  assert.ok(result.cycles[0]?.taskResults?.some((taskResult) => taskResult.status === "completed"));
+  const events = await controller.executionLog.readAll();
+  assert.equal(events.some((event) => event.eventType === "run_interrupted"), false);
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("the final admitted LLM turn can complete the root goal", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  await controller.executionLog.append({
+    taskId: "task:historical",
+    role: "executor",
+    eventType: "turn_usage",
+    payload: {}
+  });
+  const planner = createTurnAwareMockTextSession(JSON.stringify({
+    decision: "apply_commands",
+    commands: [{
+      kind: "set_node_status",
+      nodeId: "goal:root",
+      status: "achieved",
+      reason: "The final admitted turn completed the root goal.",
+      basedOnRefs: ["goal:root"]
+    }],
+    reason: "The final admitted turn completed the root goal.",
+    basedOnRefs: ["goal:root"]
+  }));
+  controllerHarness.agents = {
+    planner,
+    executor: createTurnAwareMockTextSession("{}"),
+    observer: createAbortableMockTextSession(observerProjectionJson())
+  };
+
+  const result = await controller.runUntilDone({
+    userGoal: "Complete at the turn boundary",
+    scopeSummary: "Authorized target only",
+    maxPlannerCycles: 4,
+    maxLlmTurns: 1
+  });
+
+  assert.equal(result.completed, true);
+  assert.equal(result.llmTurnsUsed, 1);
+  assert.equal(result.remainingLlmTurns, 0);
+  assert.equal(planner.promptCount(), 1);
+  const events = await controller.executionLog.readAll();
+  assert.equal(events.filter((event) => event.eventType === "llm_turn_started").length, 1);
+  assert.equal(events.some((event) => event.eventType === "llm_turn_budget_exhausted"), false);
+  await controller.close({ drainProjectionJobs: false });
+});
+
 function createControllerHarness(): {
   controller: SecurityAgentController;
   controllerHarness: ControllerHarness;
@@ -4659,6 +4872,144 @@ function createMockTextSessionSequence(outputs: string[]): {
     },
     steers(): string[] {
       return [...steerTexts];
+    }
+  };
+}
+
+function createTurnAwareMockTextSession(output: string): ReturnType<typeof createMockTextSession> & {
+  abort: () => Promise<void>;
+} {
+  const listeners: Array<(event: unknown) => void> = [];
+  const promptTexts: string[] = [];
+  const steerTexts: string[] = [];
+  let aborted = false;
+  return {
+    async prompt(text: string): Promise<void> {
+      promptTexts.push(text);
+      for (const listener of [...listeners]) {
+        listener({ type: "turn_start" });
+      }
+      if (aborted) {
+        for (const listener of [...listeners]) {
+          listener({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              stopReason: "aborted",
+              errorMessage: "Request was aborted",
+              content: []
+            }
+          });
+        }
+        return;
+      }
+      for (const listener of [...listeners]) {
+        listener({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: output }]
+          }
+        });
+      }
+    },
+    async steer(text: string): Promise<void> {
+      steerTexts.push(text);
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) {
+          listeners.splice(index, 1);
+        }
+      };
+    },
+    promptCount(): number {
+      return promptTexts.length;
+    },
+    prompts(): string[] {
+      return [...promptTexts];
+    },
+    steers(): string[] {
+      return [...steerTexts];
+    },
+    async abort(): Promise<void> {
+      aborted = true;
+    }
+  };
+}
+
+function createTurnAwareDelayedMockTextSession(
+  outputFactory: () => Promise<string>
+): ReturnType<typeof createMockTextSession> & {
+  abort: () => Promise<void>;
+  abortCount: () => number;
+  responseWasAborted: () => boolean | undefined;
+} {
+  const listeners: Array<(event: unknown) => void> = [];
+  const promptTexts: string[] = [];
+  const steerTexts: string[] = [];
+  let aborted = false;
+  let aborts = 0;
+  let responseWasAborted: boolean | undefined;
+  return {
+    async prompt(text: string): Promise<void> {
+      promptTexts.push(text);
+      for (const listener of [...listeners]) {
+        listener({ type: "turn_start" });
+      }
+      const output = await outputFactory();
+      responseWasAborted = aborted;
+      for (const listener of [...listeners]) {
+        listener({
+          type: "message_end",
+          message: aborted
+            ? {
+              role: "assistant",
+              stopReason: "aborted",
+              errorMessage: "Request was aborted",
+              content: []
+            }
+            : {
+              role: "assistant",
+              stopReason: "stop",
+              content: [{ type: "text", text: output }]
+            }
+        });
+      }
+    },
+    async steer(text: string): Promise<void> {
+      steerTexts.push(text);
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) {
+          listeners.splice(index, 1);
+        }
+      };
+    },
+    promptCount(): number {
+      return promptTexts.length;
+    },
+    prompts(): string[] {
+      return [...promptTexts];
+    },
+    steers(): string[] {
+      return [...steerTexts];
+    },
+    async abort(): Promise<void> {
+      aborts += 1;
+      aborted = true;
+    },
+    abortCount(): number {
+      return aborts;
+    },
+    responseWasAborted(): boolean | undefined {
+      return responseWasAborted;
     }
   };
 }
