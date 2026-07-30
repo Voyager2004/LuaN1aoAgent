@@ -336,6 +336,7 @@ export class SecurityAgentController {
   private isolatedSessionsEnabled = false;
   private structuredInvocationsEnabled = false;
   private activeRun?: ActiveRunRecord;
+  private globalLlmTurnBudgetAbortContext?: RuntimeAbortContext;
   private currentUserGoal?: string;
 
   constructor(input: { cwd: string; runtimeDir?: string; environment?: NodeJS.ProcessEnv }) {
@@ -556,6 +557,7 @@ export class SecurityAgentController {
         maxTaskBudget: MAX_TASK_BUDGET
       }
     });
+    this.globalLlmTurnBudgetAbortContext = undefined;
     this.activeRun = {
       invocationId,
       startedAt,
@@ -1329,7 +1331,7 @@ export class SecurityAgentController {
         role: "executor",
         getTaskId: () => taskEnvelope.taskId,
         getEpochId: () => state.epochId,
-        getAbortContext: () => state.abortContext,
+        getAbortContext: () => state.abortContext ?? this.globalLlmTurnBudgetAbortContext,
         onTurnStart: () => this.admitExecutorTurn(taskEnvelope, state),
         onPersistedEvent: (event) => this.handleExecutorEventPersisted(event)
       });
@@ -1390,7 +1392,11 @@ export class SecurityAgentController {
         providerFailure = state.executorStopRequested || this.isGlobalLlmTurnBudgetExhausted()
           ? undefined
           : classifyExecutorProviderFailure(error, error, executorOutput);
-        executorInvocationStatus = providerFailure?.retryable ? "provider_error" : "failed";
+        executorInvocationStatus = state.abortContext?.kind === "budget_abort"
+          ? "budget_exhausted"
+          : state.abortContext
+            ? "runtime_abort"
+            : providerFailure?.retryable ? "provider_error" : "failed";
       } finally {
         await executorLogging?.drain();
         await this.appendInvocationMetrics({
@@ -1743,6 +1749,7 @@ export class SecurityAgentController {
           executionLog: this.executionLog,
           artifactStore: this.artifactStore,
           role: "planner",
+          getAbortContext: () => this.globalLlmTurnBudgetAbortContext,
           onTurnStart: () => this.tryAcquireGlobalLlmTurn()
         });
         const plannerDecision = this.structuredInvocationsEnabled
@@ -1876,6 +1883,10 @@ export class SecurityAgentController {
     if (!activeRun.llmTurnBudgetStopRequested) {
       activeRun.llmTurnBudgetStopRequested = true;
       const reason = this.globalLlmTurnBudgetStopReason(activeRun);
+      this.globalLlmTurnBudgetAbortContext = {
+        kind: "budget_abort",
+        reason
+      };
       void this.executionLog.append({
         role: "runtime",
         eventType: "llm_turn_budget_exhausted",
@@ -1911,6 +1922,7 @@ export class SecurityAgentController {
         return false;
       }
       if (!this.tryAcquireGlobalLlmTurn()) {
+        state.abortContext ??= this.globalLlmTurnBudgetAbortContext;
         return false;
       }
       state.checkpointTerminalTurnsRemaining -= 1;
@@ -1918,6 +1930,8 @@ export class SecurityAgentController {
       return true;
     }
     if (!this.tryAcquireGlobalLlmTurn()) {
+      state.abortContext ??= this.globalLlmTurnBudgetAbortContext;
+      state.executorStopRequested = true;
       return false;
     }
     state.executorTurnStartCount += 1;
@@ -1969,6 +1983,7 @@ export class SecurityAgentController {
       role: "observer",
       getTaskId: () => taskId,
       getEpochId: () => this.getActiveTaskState(taskId)?.epochId,
+      getAbortContext: () => this.getActiveTaskState(taskId)?.abortContext ?? this.globalLlmTurnBudgetAbortContext,
       onTurnStart: () => this.tryAcquireGlobalLlmTurn()
     });
     return { session: observer.session, dynamicObserver: true, logging };
@@ -2875,6 +2890,31 @@ export class SecurityAgentController {
         });
         return projection;
       }
+      if (this.isGlobalLlmTurnBudgetExhausted()) {
+        const fallbackProjection = await this.commitProjectorSubmissionFallback({
+          input,
+          claim,
+          sourceEventIds: expectedSourceEventIds,
+          error: new StructuredInvocationError(
+            `${this.globalLlmTurnBudgetStopReason()} before projector invocation; committed the final source range without an additional model turn`,
+            "timeout"
+          ),
+          degradationReason: "global_llm_turn_budget",
+          metrics: {
+            fromSeq: claim.fromSeq,
+            toSeq: projectionToSeq,
+            desiredSeq: claim.toSeq,
+            durationMs: Date.now() - projectorInvocationStartedAt,
+            inputBytes: prepared.inputBytes,
+            observationCount: prepared.batch.observations.length
+          }
+        });
+        if (fallbackProjection) {
+          projectionCommitted = true;
+          projectorInvocationStatus = "degraded_without_llm";
+          return fallbackProjection;
+        }
+      }
       const prePromptCancellationReason = this.projectionWriteBlockedReason();
       if (prePromptCancellationReason) {
         return this.discardProjectionJob(input, prePromptCancellationReason);
@@ -2959,12 +2999,16 @@ export class SecurityAgentController {
       });
       return projection;
     } catch (promptError) {
-      const fallbackProjection = isRecoverableProjectorSubmissionError(promptError)
+      const degradationReason = this.isGlobalLlmTurnBudgetExhausted()
+        ? "global_llm_turn_budget"
+        : undefined;
+      const fallbackProjection = (degradationReason || isRecoverableProjectorSubmissionError(promptError))
         ? await this.commitProjectorSubmissionFallback({
           input,
           claim,
           sourceEventIds: expectedSourceEventIds,
           error: promptError,
+          degradationReason,
           metrics: {
             fromSeq: claim.fromSeq,
             toSeq: projectorProjectionToSeq,
@@ -3075,6 +3119,7 @@ export class SecurityAgentController {
     claim: ProjectionClaim;
     sourceEventIds: string[];
     error: unknown;
+    degradationReason?: "global_llm_turn_budget";
     metrics: {
       fromSeq: number;
       toSeq: number;
@@ -3088,6 +3133,10 @@ export class SecurityAgentController {
     if (cancellationReason) {
       return undefined;
     }
+    const degradationReason = input.degradationReason ?? "projector_submission_unusable";
+    const controlReason = degradationReason === "global_llm_turn_budget"
+      ? "Global LLM turn budget reached; committed source observations without an additional projector turn"
+      : "Projector omitted graph_delta_submit; source observations were retained in the execution log";
     const projection: ObserverProjection = {
       graphDelta: {
         sourceEventIds: input.sourceEventIds,
@@ -3096,7 +3145,7 @@ export class SecurityAgentController {
       },
       controlSignal: {
         decision: "continue",
-        reason: "Projector omitted graph_delta_submit; source observations were retained in the execution log",
+        reason: controlReason,
         evidenceRefs: input.sourceEventIds,
         confidence: "low"
       }
@@ -3111,14 +3160,18 @@ export class SecurityAgentController {
     projection.graphDelta = commitResult.delta;
     this.projectionRetryCountByTask.delete(input.input.taskEnvelope.taskId);
     const errorMessage = errorMessageFromUnknown(input.error) ?? "Projector did not produce a usable graph_delta_submit";
+    const summaryPrefix = degradationReason === "global_llm_turn_budget"
+      ? "committed source range without a projector turn at the global LLM budget boundary"
+      : "committed source range without semantic delta";
     await this.executionLog.append({
       taskId: input.input.taskEnvelope.taskId,
       role: "observer",
       eventType: "projection_job_degraded",
-      summary: `committed source range without semantic delta: ${errorMessage}`,
+      summary: `${summaryPrefix}: ${errorMessage}`,
       payload: {
         queueId: input.input.queueId,
         reason: input.input.reason,
+        degradationReason,
         error: errorMessage,
         generation: input.claim.generation,
         ...input.metrics,
@@ -3131,7 +3184,7 @@ export class SecurityAgentController {
       reason: input.input.reason,
       projection,
       outputPreview: "",
-      error: `degraded: ${errorMessage}`,
+      error: `degraded (${degradationReason}): ${errorMessage}`,
       queueId: input.input.queueId,
       generation: input.claim.generation,
       ...input.metrics,
@@ -3821,13 +3874,17 @@ export class SecurityAgentController {
       stringProperty(this.getTaskStatusSnapshot(input.taskEnvelope.taskId)?.resultSummary)
     );
     const artifactRefs = dedupeStrings(observations.flatMap((observation) => observation.artifactRefs));
-    const isInfraAbort = state?.abortContext?.kind === "budget_abort"
-      || (!signal && /concurrency limit|rate limit|too many requests|\b429\b|\b5\d\d\b|bad gateway|service unavailable|timed out|timeout/i.test(input.reason));
+    const endedAtBudgetBoundary = state?.abortContext?.kind === "budget_abort";
+    const isInfraAbort = !endedAtBudgetBoundary
+      && !signal
+      && /concurrency limit|rate limit|too many requests|\b429\b|\b5\d\d\b|bad gateway|service unavailable|timed out|timeout/i.test(input.reason);
     const summary = [
       observationSummary ? `本轮因果观察：\n${observationSummary}` : undefined,
       previousResultSummary ? `既有阶段结果：${previousResultSummary}` : undefined,
       signal
         ? `Executor checkpointed by Observer/Controller: ${truncateText(signal.reason, 320)}`
+        : endedAtBudgetBoundary
+          ? `Executor stopped at configured budget: ${truncateText(state?.abortContext?.reason ?? input.reason, 320)}`
         : `Executor ended without valid TaskResult: ${truncateText(input.reason, 320)}`,
       !observationSummary && input.executorOutputPreview.trim().length > 0
         ? `Executor 输出：${truncateText(input.executorOutputPreview, 320)}`
@@ -3846,7 +3903,7 @@ export class SecurityAgentController {
       suggestedNextGoal: !isInfraAbort && signal && ["checkpoint", "need_planner", "stop_executor"].includes(signal.decision)
         ? "Planner should read the updated graph and create the next goal-level task if needed."
         : undefined,
-      checkpointReason: signal?.reason,
+      checkpointReason: signal?.reason ?? (endedAtBudgetBoundary ? state?.abortContext?.reason : undefined),
       retryable: isInfraAbort ? true : signal?.decision !== "stop_executor",
       attempt: state?.attempt ?? this.nextTaskAttempt(input.taskEnvelope.taskId),
       resumeCursor: state?.lastEventId,

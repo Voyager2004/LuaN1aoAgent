@@ -13,6 +13,18 @@ const TASK_OUTCOME_EVENT_TYPES = new Set([
 
 const LEGACY_RAW_RESULT_INTERPRETATION = "No recorded Executor interpretation; use only the raw result as evidence.";
 const MISSING_RESULT_INTERPRETATION = "Executor continued without recording a conclusion for the previous result; treat it as inconclusive.";
+const PROJECTOR_GRAPH_DELTA_MAX_NODES = 12;
+const PROJECTOR_GRAPH_DELTA_MAX_EDGES = 20;
+const PROJECTOR_GRAPH_DELTA_MAX_BATCHES = 16;
+const PROJECTOR_EXCLUDED_EDGE_TYPES = new Set([
+  "decomposes_to",
+  "depends_on",
+  "within_scope",
+  "produces_milestone",
+  "blocked_by",
+  "unblocked_by",
+  "requires_evidence"
+]);
 
 export type ProjectionObservation = {
   ref: string;
@@ -312,7 +324,8 @@ export function expandProjectionDraft(input: {
   graphContext: ProjectionGraphContext;
 }): GraphDelta {
   const record = isRecord(input.value) ? input.value : {};
-  const draft = isRecord(record.graphDelta) ? record.graphDelta : record;
+  const submittedDraft = isRecord(record.graphDelta) ? record.graphDelta : record;
+  const draft = flattenProjectorGraphDelta(submittedDraft);
   const observationRefs = new Map(input.batch.observations.map((observation) => [observation.ref, observation.sourceEventIds]));
   const sourceEventIds = new Set(input.batch.sourceEventIds);
   const resolveEvidenceRefs = (value: unknown): string[] => dedupeStrings(
@@ -333,7 +346,7 @@ export function expandProjectionDraft(input: {
   };
   const nodesById = new Map<string, GraphNode>();
   if (Array.isArray(draft.nodes)) {
-    for (const node of draft.nodes.filter(isRecord).slice(0, 12)) {
+    for (const node of draft.nodes.filter(isRecord).slice(0, PROJECTOR_GRAPH_DELTA_MAX_NODES * PROJECTOR_GRAPH_DELTA_MAX_BATCHES)) {
       const submittedRef = String(node.id ?? "").trim();
       const existingId = input.graphContext.nodeAliases.get(submittedRef);
       const resolvedId = existingId ?? (submittedRef.startsWith("new:")
@@ -379,7 +392,7 @@ export function expandProjectionDraft(input: {
     ...nodes.map((node) => [node.id, node] as const)
   ]);
   const edges = Array.isArray(draft.edges)
-    ? draft.edges.filter(isRecord).slice(0, 20).map((edge) => {
+    ? draft.edges.filter(isRecord).slice(0, PROJECTOR_GRAPH_DELTA_MAX_EDGES * PROJECTOR_GRAPH_DELTA_MAX_BATCHES).map((edge) => {
       const type = String(edge.type ?? "supports");
       const properties = compactSubmittedProperties(edge.properties);
       return {
@@ -406,6 +419,26 @@ export function expandProjectionDraft(input: {
   };
 }
 
+function flattenProjectorGraphDelta(value: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(value.batches)) {
+    return value;
+  }
+  const nodes: unknown[] = [];
+  const edges: unknown[] = [];
+  for (const candidate of value.batches.slice(0, PROJECTOR_GRAPH_DELTA_MAX_BATCHES)) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    if (Array.isArray(candidate.nodes)) {
+      nodes.push(...candidate.nodes);
+    }
+    if (Array.isArray(candidate.edges)) {
+      edges.push(...candidate.edges);
+    }
+  }
+  return { nodes, edges };
+}
+
 /**
  * Projector output is schema-checked before it reaches this expansion step, but
  * some edge names have endpoint-type invariants that JSON Schema cannot express.
@@ -418,6 +451,9 @@ function projectorEdgeHasCompatibleEndpoints(
   toNode: GraphNode | undefined
 ): boolean {
   if (!fromNode || !toNode) {
+    return false;
+  }
+  if (PROJECTOR_EXCLUDED_EDGE_TYPES.has(edge.type)) {
     return false;
   }
   if (edge.type === "tunnels_to" || edge.type === "proxy_route") {

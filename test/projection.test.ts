@@ -270,6 +270,54 @@ test("expands graph aliases and observation evidence refs into stable GraphDelta
   assert.match(renderProjectionGraphContext(graphContext), /existing:1 operation\/WebEndpoint/);
 });
 
+test("expands transport batches as one graph delta without dropping cross-batch relations", () => {
+  const batch = {
+    observations: [{
+      ref: "o1",
+      kind: "action" as const,
+      seqStart: 1,
+      seqEnd: 1,
+      action: "bash",
+      outcomeDigest: "Collected bounded observations",
+      status: "ok" as const,
+      artifactRefs: [],
+      anchors: [],
+      sourceEventIds: ["event:1"]
+    }],
+    toSeq: 1,
+    sourceEventIds: ["event:1"]
+  };
+  const makeNode = (index: number) => ({
+    id: `new:${index}`,
+    graphKind: "reasoning",
+    type: "Evidence",
+    label: `observation ${index}`,
+    properties: { index },
+    evidenceRefs: ["o1"]
+  });
+  const delta = expandProjectionDraft({
+    batch,
+    graphContext: aliasProjectionGraphContext({ nodes: [], edges: [] }),
+    value: {
+      batches: [{
+        nodes: Array.from({ length: 12 }, (_value, index) => makeNode(index + 1)),
+        edges: [{ from: "new:1", to: "new:13", type: "supports", evidenceRefs: ["o1"] }]
+      }, {
+        nodes: [makeNode(13)],
+        edges: [{ from: "new:12", to: "new:13", type: "supports", evidenceRefs: ["o1"] }]
+      }]
+    }
+  });
+
+  assert.equal(delta.nodes.length, 13);
+  assert.equal(delta.edges.length, 2);
+  assert.ok(delta.edges.every((edge) => (
+    delta.nodes.some((node) => node.id === edge.from)
+      && delta.nodes.some((node) => node.id === edge.to)
+  )));
+  assert.ok(delta.nodes.some((node) => node.label === "observation 13"));
+});
+
 test("projector cannot write task graph nodes or task edges", () => {
   const graphContext = aliasProjectionGraphContext({
     nodes: [{
@@ -596,6 +644,49 @@ test("projector drops topology edges whose endpoint types violate graph invarian
   });
 
   assert.deepEqual(delta.edges.map((edge) => edge.type), ["session_on"]);
+});
+
+test("projector drops task-only relation types between semantic nodes", () => {
+  const delta = expandProjectionDraft({
+    batch: {
+      observations: [{
+        ref: "o1",
+        kind: "action",
+        seqStart: 1,
+        seqEnd: 1,
+        action: "bash",
+        outcomeDigest: "Collected two observations",
+        status: "ok",
+        artifactRefs: [],
+        anchors: [],
+        sourceEventIds: ["event:1"]
+      }],
+      toSeq: 1,
+      sourceEventIds: ["event:1"]
+    },
+    graphContext: aliasProjectionGraphContext({ nodes: [], edges: [] }),
+    value: {
+      nodes: [{
+        id: "new:1",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "first observation",
+        properties: {},
+        evidenceRefs: ["o1"]
+      }, {
+        id: "new:2",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "second observation",
+        properties: {},
+        evidenceRefs: ["o1"]
+      }],
+      edges: [{ from: "new:1", to: "new:2", type: "depends_on", evidenceRefs: ["o1"] }]
+    }
+  });
+
+  assert.equal(delta.nodes.length, 2);
+  assert.deepEqual(delta.edges, []);
 });
 
 test("canonical operation identities cover agent and shell sessions", () => {

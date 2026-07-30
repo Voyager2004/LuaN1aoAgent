@@ -111,6 +111,10 @@ type TestActiveState = {
     setActiveToolsByName?: (toolNames: string[]) => void;
   };
   executorStopRequested: boolean;
+  abortContext?: {
+    kind: "budget_abort" | "observer_abort" | "controller_abort";
+    reason: string;
+  };
   supervisionState: {
     progressDigest: string;
     repeatedPatterns: string[];
@@ -516,6 +520,28 @@ test("synthesizes partial TaskResult after aborted non-json executor output", as
   assert.equal(taskResult.retryable, true);
   assert.equal(taskResult.attempt, 1);
   harness.controller.close();
+});
+
+test("global LLM budget boundary produces a resumable partial TaskResult", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  state.abortContext = {
+    kind: "budget_abort",
+    reason: "Reached global LLM turn budget: 100"
+  };
+
+  const taskResult = await harness.controllerHarness.createSyntheticTaskResult({
+    taskEnvelope,
+    reason: "This operation was aborted",
+    executorOutputPreview: ""
+  });
+
+  assert.equal(taskResult.status, "partial");
+  assert.equal(taskResult.checkpointReason, "Reached global LLM turn budget: 100");
+  assert.equal(taskResult.retryable, true);
+  assert.match(taskResult.summary, /configured budget/);
+  await harness.controller.close({ drainProjectionJobs: false });
 });
 
 test("synthetic TaskResult preserves a middle-epoch breakthrough after later noisy probes", async () => {
@@ -1485,6 +1511,56 @@ test("terminal projection consumes its remaining tail in one job", async () => {
   const events = await harness.controller.executionLog.readAll();
   assert.equal(events.filter((event) => event.eventType === "projection_job_started").length, 1);
   assert.equal(events.some((event) => event.eventType === "projection_terminal_drain_started"), false);
+  await harness.controller.close();
+});
+
+test("terminal projection commits its source range without an LLM turn after the global budget is exhausted", async () => {
+  const harness = createObserverControllerHarness(observerProjectionJson());
+  const taskEnvelope = makeTaskEnvelope({ budget: { ...DEFAULT_TASK_BUDGET, maxTurns: 20 } });
+  const event = await persistExecutorEvent(harness.controller, taskEnvelope.taskId, "tool_finished", "terminal observation");
+  harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, event.seq ?? 0, 0);
+  (harness.controllerHarness as unknown as {
+    activeRun: {
+      invocationId: string;
+      startedAt: number;
+      maxRunTimeMs: number;
+      deadlineAt: number;
+      startSeq: number;
+      maxLlmTurns: number;
+      llmTurnsStarted: number;
+      llmTurnBudgetStopRequested: boolean;
+    };
+  }).activeRun = {
+    invocationId: "run:budget-exhausted",
+    startedAt: Date.now(),
+    maxRunTimeMs: 1_000,
+    deadlineAt: Date.now() + 1_000,
+    startSeq: 0,
+    maxLlmTurns: 1,
+    llmTurnsStarted: 1,
+    llmTurnBudgetStopRequested: true
+  };
+
+  await harness.controllerHarness.runProjectionJob({
+    reason: "task_end",
+    taskEnvelope,
+    taskResult: {
+      taskId: taskEnvelope.taskId,
+      status: "partial",
+      summary: "terminal projection at the global budget boundary",
+      evidenceRefs: [],
+      artifactRefs: []
+    }
+  });
+
+  const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
+  assert.equal(state.committedSeq, state.desiredSeq);
+  assert.equal(harness.observerPromptCount(), 0);
+  const events = await harness.controller.executionLog.readAll();
+  const degraded = events.find((event) => event.eventType === "projection_job_degraded");
+  assert.equal(degraded?.payload.degradationReason, "global_llm_turn_budget");
+  assert.equal(events.some((event) => event.eventType === "provider_error"), false);
+  assert.equal(events.some((event) => event.eventType === "projection_job_failed"), false);
   await harness.controller.close();
 });
 
@@ -4277,6 +4353,10 @@ test("global LLM turn budget is shared across planner and executor sessions", as
     ["planner"]
   );
   assert.ok(events.some((event) => event.eventType === "llm_turn_budget_exhausted"));
+  assert.ok(events.some((event) => (
+    event.eventType === "runtime_control" && event.payload.errorKind === "budget_abort"
+  )));
+  assert.equal(events.some((event) => event.eventType === "provider_error"), false);
   await controller.close({ drainProjectionJobs: false });
 });
 

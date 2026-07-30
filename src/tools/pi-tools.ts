@@ -86,6 +86,16 @@ const ProjectorGraphEdgeTypeSchema = Type.Union([
   Type.Literal("spawns_process")
 ]);
 
+const ProjectorExcludedGraphEdgeTypes = new Set([
+  "decomposes_to",
+  "depends_on",
+  "within_scope",
+  "produces_milestone",
+  "blocked_by",
+  "unblocked_by",
+  "requires_evidence"
+]);
+
 const GraphScalarSchema = Type.Union([
   Type.String({ maxLength: 600 }),
   Type.Number(),
@@ -171,19 +181,36 @@ const GraphEdgeSchema = Type.Object({
 const ProjectorGraphEdgeSchema = Type.Object({
   from: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
   to: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
-  // Edges connected to task-shaped proposals are discarded by the projection
-  // expander.  Accepting their enum values keeps that sanitization deterministic.
-  type: GraphEdgeTypeSchema,
+  // Projectors cannot mutate the task graph; task-only relation types are
+  // removed by the compatibility normalizer before this strict check.
+  type: ProjectorGraphEdgeTypeSchema,
   properties: Type.Optional(Type.Object({}, { additionalProperties: GraphPropertyValueSchema })),
   evidenceRefs: Type.Optional(Type.Array(Type.String({ maxLength: 32 }), { maxItems: 8 }))
 }, { additionalProperties: false });
 
-const ProjectorGraphNodeArraySchema = Type.Array(ProjectorGraphNodeSchema, { maxItems: 12 });
-const ProjectorGraphEdgeArraySchema = Type.Array(ProjectorGraphEdgeSchema, { maxItems: 20 });
-const GraphDeltaSubmitParameters = Type.Object({
+const PROJECTOR_GRAPH_DELTA_MAX_NODES = 12;
+const PROJECTOR_GRAPH_DELTA_MAX_EDGES = 20;
+const PROJECTOR_GRAPH_DELTA_MAX_BATCHES = 16;
+
+const ProjectorGraphNodeArraySchema = Type.Array(ProjectorGraphNodeSchema, {
+  maxItems: PROJECTOR_GRAPH_DELTA_MAX_NODES
+});
+const ProjectorGraphEdgeArraySchema = Type.Array(ProjectorGraphEdgeSchema, {
+  maxItems: PROJECTOR_GRAPH_DELTA_MAX_EDGES
+});
+const ProjectorGraphDeltaSchema = Type.Object({
   nodes: ProjectorGraphNodeArraySchema,
   edges: ProjectorGraphEdgeArraySchema
 }, { additionalProperties: false });
+const GraphDeltaSubmitParameters = Type.Union([
+  ProjectorGraphDeltaSchema,
+  Type.Object({
+    batches: Type.Array(ProjectorGraphDeltaSchema, {
+      minItems: 1,
+      maxItems: PROJECTOR_GRAPH_DELTA_MAX_BATCHES
+    })
+  }, { additionalProperties: false })
+]);
 type GraphDeltaSubmitParams = Static<typeof GraphDeltaSubmitParameters>;
 
 const ProjectorNodeGraphKindByType: Record<string, "reasoning" | "operation" | "task"> = {
@@ -390,10 +417,26 @@ function prepareGraphDeltaSubmitArguments(args: unknown): GraphDeltaSubmitParams
     return args as GraphDeltaSubmitParams;
   }
   const input = args as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(input, "batches")) {
+    return {
+      ...input,
+      batches: normalizeProjectorBatches(input.batches)
+    } as GraphDeltaSubmitParams;
+  }
+  const nodes = normalizeProjectorNodeGraphKinds(decodeSerializedArray(input.nodes));
+  const edges = normalizeProjectorEdgeFields(decodeSerializedArray(input.edges));
+  if (Array.isArray(nodes) && Array.isArray(edges)
+    && (nodes.length > PROJECTOR_GRAPH_DELTA_MAX_NODES || edges.length > PROJECTOR_GRAPH_DELTA_MAX_EDGES)) {
+    const { nodes: _nodes, edges: _edges, ...rest } = input;
+    return {
+      ...rest,
+      batches: partitionProjectorGraphDelta(nodes, edges)
+    } as GraphDeltaSubmitParams;
+  }
   return {
     ...input,
-    nodes: normalizeProjectorNodeGraphKinds(decodeSerializedArray(input.nodes)),
-    edges: decodeSerializedArray(input.edges)
+    nodes,
+    edges
   } as GraphDeltaSubmitParams;
 }
 
@@ -410,7 +453,7 @@ function decodeSerializedArray(value: unknown): unknown {
 }
 
 function normalizeProjectorNodeGraphKinds(value: unknown): unknown {
-  if (!Array.isArray(value) || value.length > 12) {
+  if (!Array.isArray(value)) {
     return value;
   }
   return value.map((candidate) => {
@@ -430,6 +473,67 @@ function normalizeProjectorNodeGraphKinds(value: unknown): unknown {
     }
     return { ...node, graphKind: expectedGraphKind };
   });
+}
+
+function normalizeProjectorEdgeFields(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+  return value.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      return [candidate];
+    }
+    const edge = candidate as Record<string, unknown>;
+    if (typeof edge.type === "string" && ProjectorExcludedGraphEdgeTypes.has(edge.type)) {
+      return [];
+    }
+    const normalized: Record<string, unknown> = {
+      from: edge.from,
+      to: edge.to,
+      type: edge.type
+    };
+    if (Object.prototype.hasOwnProperty.call(edge, "properties")) {
+      normalized.properties = edge.properties;
+    }
+    if (Object.prototype.hasOwnProperty.call(edge, "evidenceRefs")) {
+      normalized.evidenceRefs = edge.evidenceRefs;
+    }
+    return [normalized];
+  });
+}
+
+function normalizeProjectorBatches(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+  return value.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      return candidate;
+    }
+    const batch = candidate as Record<string, unknown>;
+    return {
+      ...batch,
+      nodes: normalizeProjectorNodeGraphKinds(decodeSerializedArray(batch.nodes)),
+      edges: normalizeProjectorEdgeFields(decodeSerializedArray(batch.edges))
+    };
+  });
+}
+
+function partitionProjectorGraphDelta(nodes: unknown[], edges: unknown[]): Array<{ nodes: unknown[]; edges: unknown[] }> {
+  const batchCount = Math.max(
+    Math.ceil(nodes.length / PROJECTOR_GRAPH_DELTA_MAX_NODES),
+    Math.ceil(edges.length / PROJECTOR_GRAPH_DELTA_MAX_EDGES)
+  );
+  return Array.from({ length: batchCount }, (_value, index) => ({
+    nodes: nodes.slice(
+      index * PROJECTOR_GRAPH_DELTA_MAX_NODES,
+      (index + 1) * PROJECTOR_GRAPH_DELTA_MAX_NODES
+    ),
+    edges: edges.slice(
+      index * PROJECTOR_GRAPH_DELTA_MAX_EDGES,
+      (index + 1) * PROJECTOR_GRAPH_DELTA_MAX_EDGES
+    )
+  }));
 }
 
 export function createGraphQueryTool(graphStore: SQLiteGraphStore) {

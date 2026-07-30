@@ -44,54 +44,67 @@ test("executor exposes bounded public research tools", () => {
 test("projector terminal tool accepts bounded task-shaped drafts for deterministic sanitization", () => {
   const tool = createGraphDeltaSubmitTool();
   const schema = tool.parameters as unknown as {
-    properties: {
-      nodes: {
-        maxItems?: number;
-        items?: {
-          anyOf?: Array<{
-            additionalProperties?: boolean;
-            properties?: {
-              id?: { pattern?: string };
-              graphKind?: { const?: string };
-              properties?: { additionalProperties?: { anyOf?: unknown[] } };
-            };
-          }>;
-        };
-      };
-      edges: {
-        maxItems?: number;
-        items?: {
-          additionalProperties?: boolean;
-          properties?: {
-            from?: { pattern?: string };
-            to?: { pattern?: string };
-            type?: { anyOf?: Array<{ const?: string }> };
+    anyOf?: Array<{
+      properties?: {
+        nodes?: {
+          maxItems?: number;
+          items?: {
+            anyOf?: Array<{
+              additionalProperties?: boolean;
+              properties?: {
+                id?: { pattern?: string };
+                graphKind?: { const?: string };
+                properties?: { additionalProperties?: { anyOf?: unknown[] } };
+              };
+            }>;
           };
         };
+        edges?: {
+          maxItems?: number;
+          items?: {
+            additionalProperties?: boolean;
+            properties?: {
+              from?: { pattern?: string };
+              to?: { pattern?: string };
+              type?: { anyOf?: Array<{ const?: string }> };
+            };
+          };
+        };
+        batches?: { maxItems?: number; items?: unknown };
+        sourceEventIds?: unknown;
       };
-      sourceEventIds?: unknown;
-    };
-    additionalProperties?: boolean;
+      additionalProperties?: boolean;
+    }>;
   };
+  const flatSchema = schema.anyOf?.find((branch) => branch.properties?.nodes !== undefined);
+  const batchesSchema = schema.anyOf?.find((branch) => branch.properties?.batches !== undefined);
+  const nodesSchema = flatSchema?.properties?.nodes;
+  const edgesSchema = flatSchema?.properties?.edges;
 
-  assert.equal(schema.properties.nodes.maxItems, 12);
-  assert.equal(schema.properties.edges.maxItems, 20);
+  assert.equal(nodesSchema?.maxItems, 12);
+  assert.equal(edgesSchema?.maxItems, 20);
   assert.deepEqual(
-    schema.properties.nodes.items?.anyOf?.map((branch) => branch.properties?.graphKind?.const),
+    nodesSchema?.items?.anyOf?.map((branch) => branch.properties?.graphKind?.const),
     ["reasoning", "operation", "task"]
   );
-  assert.ok(schema.properties.nodes.items?.anyOf?.every((branch) => branch.additionalProperties === false));
-  assert.ok(schema.properties.nodes.items?.anyOf?.every((branch) => branch.properties?.id?.pattern === "^(existing|new):[1-9][0-9]*$"));
-  assert.ok(schema.properties.nodes.items?.anyOf?.every((branch) => (branch.properties?.properties?.additionalProperties?.anyOf?.length ?? 0) > 0));
-  assert.equal(schema.properties.edges.items?.additionalProperties, false);
-  assert.equal(schema.properties.edges.items?.properties?.from?.pattern, "^(existing|new):[1-9][0-9]*$");
-  assert.equal(schema.properties.edges.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
+  assert.ok(nodesSchema?.items?.anyOf?.every((branch) => branch.additionalProperties === false));
+  assert.ok(nodesSchema?.items?.anyOf?.every((branch) => branch.properties?.id?.pattern === "^(existing|new):[1-9][0-9]*$"));
+  assert.ok(nodesSchema?.items?.anyOf?.every((branch) => (branch.properties?.properties?.additionalProperties?.anyOf?.length ?? 0) > 0));
+  assert.equal(edgesSchema?.items?.additionalProperties, false);
+  assert.equal(edgesSchema?.items?.properties?.from?.pattern, "^(existing|new):[1-9][0-9]*$");
+  assert.equal(edgesSchema?.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(
-    schema.properties.edges.items?.properties?.type?.anyOf?.some((branch) => branch.const === "depends_on"),
+    edgesSchema?.items?.properties?.type?.anyOf?.some((branch) => branch.const === "supports"),
     true
   );
-  assert.equal(schema.properties.sourceEventIds, undefined);
-  assert.equal(schema.additionalProperties, false);
+  assert.equal(
+    edgesSchema?.items?.properties?.type?.anyOf?.some((branch) => branch.const === "depends_on"),
+    false
+  );
+  assert.equal(flatSchema?.properties?.sourceEventIds, undefined);
+  assert.equal(flatSchema?.additionalProperties, false);
+  assert.equal(batchesSchema?.properties?.batches?.maxItems, 16);
+  assert.equal(batchesSchema?.additionalProperties, false);
 });
 
 test("projector terminal tool prepares JSON-serialized node and edge arrays before strict validation", () => {
@@ -139,6 +152,77 @@ test("projector terminal tool repairs a node category implied by its known type 
     evidenceRefs: ["o1"]
   }]);
   assert.deepEqual(prepared.edges, []);
+  assert.equal(Check(tool.parameters, prepared), true);
+});
+
+test("projector terminal tool transports oversized drafts in bounded batches and drops extra edge annotations", () => {
+  const tool = createGraphDeltaSubmitTool();
+  const prepareArguments = tool.prepareArguments;
+  assert.ok(prepareArguments);
+  const prepared = prepareArguments({
+    nodes: Array.from({ length: 14 }, (_value, index) => ({
+      id: `new:${index + 1}`,
+      label: `service ${index + 1}`,
+      graphKind: index === 12 ? "reasoning" : "operation",
+      type: index === 12 ? "Credential" : "Service",
+      properties: {},
+      evidenceRefs: ["o1"]
+    })),
+    edges: Array.from({ length: 21 }, () => ({
+      from: "new:1",
+      to: "new:2",
+      type: "supports",
+      evidenceRefs: ["o1"],
+      providerAnnotation: "discard before schema validation"
+    }))
+  }) as {
+    batches: Array<{
+      nodes: Array<{ id: string; graphKind: string; type: string }>;
+      edges: Array<Record<string, unknown>>;
+    }>;
+  };
+
+  assert.equal(prepared.batches.length, 2);
+  assert.equal(prepared.batches[0]?.nodes.length, 12);
+  assert.equal(prepared.batches[1]?.nodes.length, 2);
+  assert.equal(prepared.batches[0]?.edges.length, 20);
+  assert.equal(prepared.batches[1]?.edges.length, 1);
+  assert.equal(prepared.batches[1]?.nodes[0]?.id, "new:13");
+  assert.equal(prepared.batches[1]?.nodes[0]?.graphKind, "operation");
+  assert.equal("providerAnnotation" in (prepared.batches[0]?.edges[0] ?? {}), false);
+  assert.equal(Check(tool.parameters, prepared), true);
+});
+
+test("projector terminal tool removes task-only relations from semantic graph drafts", () => {
+  const tool = createGraphDeltaSubmitTool();
+  const prepareArguments = tool.prepareArguments;
+  assert.ok(prepareArguments);
+  const prepared = prepareArguments({
+    nodes: [{
+      id: "new:1",
+      label: "first observation",
+      graphKind: "reasoning",
+      type: "Evidence"
+    }, {
+      id: "new:2",
+      label: "second observation",
+      graphKind: "reasoning",
+      type: "Evidence"
+    }],
+    edges: [{
+      from: "new:1",
+      to: "new:2",
+      type: "depends_on",
+      evidenceRefs: ["o1"]
+    }, {
+      from: "new:1",
+      to: "new:2",
+      type: "supports",
+      evidenceRefs: ["o1"]
+    }]
+  }) as { edges: Array<{ type: string }> };
+
+  assert.deepEqual(prepared.edges.map((edge) => edge.type), ["supports"]);
   assert.equal(Check(tool.parameters, prepared), true);
 });
 
