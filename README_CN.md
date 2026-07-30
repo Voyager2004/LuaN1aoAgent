@@ -220,7 +220,9 @@ npx skills add ljagiello/ctf-skills \
 ### 沙箱隔离
 
 - macOS 在可用时通过 `sandbox-exec` 使用 Seatbelt。
-- Linux 支持 Bubblewrap 隔离。
+- Linux 会先检查 Bubblewrap 能否正常启动；若不可用，自动模式会失败关闭，除非已配置 Docker 镜像。`workspace` 仅作为显式选择保留。
+- Linux 可通过 `EXECUTOR_SANDBOX_MODE=docker` 与 `EXECUTOR_SANDBOX_DOCKER_IMAGE=<已预置镜像>` 使用受限 Docker 后端：仅将单次运行工作区以可写方式挂载，将获准的 Skills 根目录只读挂载，移除 Linux capabilities，容器根文件系统只读，并且任务运行时不拉取镜像。
+- `EXECUTOR_SANDBOX_DOCKER_NETWORK` 支持 `host`（默认）、`bridge`、`none`。只有任务确实需要宿主机本地链路（例如受管代理）时才选择 `host`。
 - Executor 工作区和运行时根目录会被显式解析。
 - 强制沙箱模式下，访问允许根目录之外的宿主路径会失败关闭。
 - Agent 运行时状态不会作为隐式上下文暴露给隔离的 Executor Session。

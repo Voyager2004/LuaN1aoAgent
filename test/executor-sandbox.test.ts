@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import {
   createBubblewrapCommand,
+  createDockerSandboxCommand,
   createExecutorSandbox,
   SandboxPathPolicy
 } from "../src/executor-sandbox.js";
@@ -221,6 +222,60 @@ test("Linux bubblewrap command mounts only runtime roots and keeps network avail
   assert.deepEqual(command.slice(-3), ["/bin/bash", "-c", "curl http://127.0.0.1:8080"]);
 });
 
+test("Linux Docker sandbox command forwards only approved environment and mounts allowed roots", () => {
+  const sandboxRoot = "/tmp/runtime/sandboxes/run";
+  const skillRoot = "/home/test/.agents/skills";
+  const command = createDockerSandboxCommand({
+    dockerPath: "/usr/bin/docker",
+    image: "agent-runtime:latest",
+    sandboxRoot,
+    readOnlyRoots: [skillRoot],
+    command: "curl http://127.0.0.1:8080",
+    containerName: "luan1ao-run-1",
+    networkMode: "host",
+    user: "1000:1000",
+    environment: {
+      HTTP_PROXY: "http://127.0.0.1:1234",
+      HTTPS_PROXY: "http://127.0.0.1:1234",
+      SSL_CERT_FILE: `${sandboxRoot}/traffic-proxy-ca.crt`,
+      SOME_UNRELATED_VALUE: "must-not-cross-boundary"
+    }
+  });
+
+  assert.deepEqual(command.slice(0, 8), [
+    "/usr/bin/docker",
+    "run",
+    "--rm",
+    "--init",
+    "--pull",
+    "never",
+    "--name",
+    "luan1ao-run-1"
+  ]);
+  assert.ok(command.some((value, index) => value === "--network" && command[index + 1] === "host"));
+  assert.ok(command.includes("--read-only"));
+  assert.ok(command.some((value, index) => value === "--cap-drop" && command[index + 1] === "ALL"));
+  assert.ok(command.some((value, index) => value === "--security-opt" && command[index + 1] === "no-new-privileges"));
+  assert.ok(command.some((value, index) => value === "--mount"
+    && command[index + 1] === `type=bind,source=${sandboxRoot},target=${sandboxRoot},bind-propagation=rprivate`));
+  assert.ok(command.some((value, index) => value === "--mount"
+    && command[index + 1] === `type=bind,source=${skillRoot},target=${skillRoot},readonly,bind-propagation=rprivate`));
+  assert.ok(command.some((value, index) => value === "--env" && command[index + 1] === "HTTP_PROXY"));
+  assert.ok(command.some((value, index) => value === "--env" && command[index + 1] === "HTTPS_PROXY"));
+  assert.ok(command.some((value, index) => value === "--env" && command[index + 1] === "SSL_CERT_FILE"));
+  assert.equal(command.includes("SOME_UNRELATED_VALUE"), false);
+  assert.equal(command.some((value) => value.includes("must-not-cross-boundary")), false);
+  assert.equal(command.some((value) => value.includes("docker.sock")), false);
+  assert.ok(command.some((value, index) => value === "--user" && command[index + 1] === "1000:1000"));
+  assert.deepEqual(command.slice(-5), [
+    "--entrypoint",
+    "/bin/bash",
+    "agent-runtime:latest",
+    "-c",
+    "curl http://127.0.0.1:8080"
+  ]);
+});
+
 test("forced bubblewrap mode fails closed when bwrap is unavailable", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-bwrap-missing-"));
   const previousPath = process.env.BWRAP_PATH;
@@ -235,6 +290,76 @@ test("forced bubblewrap mode fails closed when bwrap is unavailable", async () =
       delete process.env.BWRAP_PATH;
     } else {
       process.env.BWRAP_PATH = previousPath;
+    }
+  }
+});
+
+test("bubblewrap startup check fails before a task can use an unusable backend", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-bwrap-startup-failure-"));
+  const fakeBubblewrap = join(runtimeDir, "fake-bwrap");
+  writeFileSync(fakeBubblewrap, "#!/bin/sh\necho namespace-disabled >&2\nexit 1\n");
+  chmodSync(fakeBubblewrap, 0o755);
+  const previousPath = process.env.BWRAP_PATH;
+  process.env.BWRAP_PATH = fakeBubblewrap;
+  try {
+    await assert.rejects(
+      () => createExecutorSandbox({ runtimeDir, runId: "run", mode: "bubblewrap" }),
+      /Bubblewrap startup check failed: Linux namespace setup is unavailable \(namespace-disabled\)/
+    );
+  } finally {
+    if (previousPath === undefined) {
+      delete process.env.BWRAP_PATH;
+    } else {
+      process.env.BWRAP_PATH = previousPath;
+    }
+  }
+});
+
+test("workspace mode remains an explicit fallback when Bubblewrap cannot initialize", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-workspace-explicit-"));
+  const fakeBubblewrap = join(runtimeDir, "fake-bwrap");
+  writeFileSync(fakeBubblewrap, "#!/bin/sh\necho should-not-run >&2\nexit 1\n");
+  chmodSync(fakeBubblewrap, 0o755);
+  const previousPath = process.env.BWRAP_PATH;
+  process.env.BWRAP_PATH = fakeBubblewrap;
+  try {
+    const sandbox = await createExecutorSandbox({ runtimeDir, runId: "run", mode: "workspace" });
+    assert.equal(sandbox.mode, "workspace");
+  } finally {
+    if (previousPath === undefined) {
+      delete process.env.BWRAP_PATH;
+    } else {
+      process.env.BWRAP_PATH = previousPath;
+    }
+  }
+});
+
+test("Linux auto mode selects Docker when Bubblewrap startup fails and a configured image is available", {
+  skip: process.platform !== "linux"
+}, async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-docker-auto-"));
+  const fakeBubblewrap = join(runtimeDir, "fake-bwrap");
+  const fakeDocker = join(runtimeDir, "fake-docker");
+  writeFileSync(fakeBubblewrap, "#!/bin/sh\necho namespace-disabled >&2\nexit 1\n");
+  writeFileSync(fakeDocker, "#!/bin/sh\nif [ \"$1\" = image ] && [ \"$2\" = inspect ]; then exit 0; fi\nexit 1\n");
+  chmodSync(fakeBubblewrap, 0o755);
+  chmodSync(fakeDocker, 0o755);
+  const previous = {
+    BWRAP_PATH: process.env.BWRAP_PATH,
+    DOCKER_PATH: process.env.DOCKER_PATH,
+    EXECUTOR_SANDBOX_DOCKER_IMAGE: process.env.EXECUTOR_SANDBOX_DOCKER_IMAGE
+  };
+  process.env.BWRAP_PATH = fakeBubblewrap;
+  process.env.DOCKER_PATH = fakeDocker;
+  process.env.EXECUTOR_SANDBOX_DOCKER_IMAGE = "agent-runtime:latest";
+  try {
+    const sandbox = await createExecutorSandbox({ runtimeDir, runId: "run" });
+    assert.equal(sandbox.mode, "linux-docker");
+    assert.equal(sandbox.backendPath, realpathSync(fakeDocker));
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
     }
   }
 });

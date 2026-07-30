@@ -361,6 +361,7 @@ export class SecurityAgentController {
         runId: this.runId,
         mode: this.executorSandbox.mode,
         backendPath: this.executorSandbox.backendPath,
+        networkMode: this.executorSandbox.networkMode,
         root: this.executorSandbox.root,
         allowedReadRoots: this.executorSandbox.allowedReadRoots
       }

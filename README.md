@@ -220,7 +220,9 @@ Skills installed by `./install.sh` live in the project-local `.agents/skills/` (
 ### Sandbox Isolation
 
 - macOS uses Seatbelt through `sandbox-exec` when available.
-- Linux supports Bubblewrap isolation.
+- Linux uses Bubblewrap when its startup check succeeds. If Bubblewrap is not usable, auto mode fails closed unless a Docker image is configured; `workspace` remains an explicit opt-in only.
+- Linux can use a constrained Docker backend with `EXECUTOR_SANDBOX_MODE=docker` and `EXECUTOR_SANDBOX_DOCKER_IMAGE=<preloaded-image>`. It mounts only the per-run workspace read-write and approved skill roots read-only, drops Linux capabilities, uses a read-only container filesystem, and never pulls an image at task time.
+- `EXECUTOR_SANDBOX_DOCKER_NETWORK` accepts `host` (default), `bridge`, or `none`. Choose `host` only when the task needs a host-local route such as a managed proxy.
 - Executor workspaces and runtime roots are resolved explicitly.
 - Host paths outside allowed roots fail closed under forced sandbox modes.
 - Agent runtime state is not exposed to isolated Executor sessions as implicit context.

@@ -7,6 +7,7 @@ import {
   createReadToolDefinition
 } from "@earendil-works/pi-coding-agent";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { execFile } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import {
   access,
@@ -30,8 +31,9 @@ import {
   resolve,
   sep
 } from "node:path";
+import { promisify } from "node:util";
 
-export type ExecutorSandboxMode = "macos-seatbelt" | "linux-bubblewrap" | "workspace";
+export type ExecutorSandboxMode = "macos-seatbelt" | "linux-bubblewrap" | "linux-docker" | "workspace";
 
 // Default per-call bash timeout (seconds) when the model does not pass one.
 // The Pi SDK schema leaves timeout optional with no default; without a floor a
@@ -43,16 +45,22 @@ function executorBashDefaultTimeoutSeconds(): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : 300;
 }
 
-export type ExecutorSandboxRequestedMode = "auto" | "seatbelt" | "bubblewrap" | "workspace";
+export type ExecutorSandboxRequestedMode = "auto" | "seatbelt" | "bubblewrap" | "docker" | "workspace";
 
 export type ExecutorSandbox = {
   root: string;
   mode: ExecutorSandboxMode;
   profilePath?: string;
   backendPath?: string;
+  networkMode?: ExecutorDockerNetworkMode;
   allowedReadRoots: string[];
   createTools: () => ToolDefinition<any, any, any>[];
 };
+
+export type ExecutorDockerNetworkMode = "host" | "bridge" | "none";
+
+const execFileAsync = promisify(execFile);
+const SANDBOX_BACKEND_STARTUP_TIMEOUT_MS = 10_000;
 
 export async function createExecutorSandbox(input: {
   runtimeDir: string;
@@ -82,21 +90,68 @@ export async function createExecutorSandbox(input: {
   const bubblewrapPath = process.platform === "linux" || requestedMode === "bubblewrap"
     ? await findExecutable(process.env.BWRAP_PATH, "bwrap")
     : undefined;
+  const dockerPath = process.platform === "linux"
+    ? await findExecutable(process.env.DOCKER_PATH, "docker")
+    : undefined;
+  const dockerImage = process.env.EXECUTOR_SANDBOX_DOCKER_IMAGE?.trim();
   if (requestedMode === "seatbelt" && !seatbeltPath) {
     throw new Error("EXECUTOR_SANDBOX_MODE=seatbelt requires macOS sandbox-exec");
   }
   if (requestedMode === "bubblewrap" && !bubblewrapPath) {
     throw new Error("EXECUTOR_SANDBOX_MODE=bubblewrap requires the bwrap executable");
   }
+  if (requestedMode === "docker" && process.platform !== "linux") {
+    throw new Error("EXECUTOR_SANDBOX_MODE=docker is supported only on Linux");
+  }
+  if (requestedMode === "docker" && !dockerPath) {
+    throw new Error("EXECUTOR_SANDBOX_MODE=docker requires the docker executable");
+  }
+  if (requestedMode === "docker" && !dockerImage) {
+    throw new Error("EXECUTOR_SANDBOX_MODE=docker requires EXECUTOR_SANDBOX_DOCKER_IMAGE");
+  }
   const useSeatbelt = requestedMode === "seatbelt"
     || (requestedMode === "auto" && Boolean(seatbeltPath));
-  const useBubblewrap = requestedMode === "bubblewrap"
+  let useBubblewrap = requestedMode === "bubblewrap"
     || (requestedMode === "auto" && !useSeatbelt && Boolean(bubblewrapPath));
+  let useDocker = requestedMode === "docker"
+    || (requestedMode === "auto" && !useSeatbelt && !useBubblewrap && Boolean(dockerPath && dockerImage));
+  const readOnlyRoots = allowedReadRoots.filter((candidate) => candidate !== canonicalRoot);
+  if (useBubblewrap && bubblewrapPath) {
+    try {
+      await verifyBubblewrapUsable({
+        bubblewrapPath,
+        sandboxRoot: canonicalRoot,
+        readOnlyRoots
+      });
+    } catch (error) {
+      if (requestedMode === "auto" && dockerPath && dockerImage) {
+        useBubblewrap = false;
+        useDocker = true;
+      } else {
+        throw error;
+      }
+    }
+  }
+  if (requestedMode === "auto" && process.platform === "linux" && !useBubblewrap && !useDocker) {
+    throw new Error(
+      "Executor sandbox auto mode requires a usable Bubblewrap backend or a configured Docker backend; set EXECUTOR_SANDBOX_MODE=workspace explicitly to run without either backend"
+    );
+  }
+  const dockerNetworkMode = useDocker ? executorDockerNetworkModeFromEnv() : undefined;
+  const dockerUser = useDocker ? currentProcessUser() : undefined;
+  if (useDocker && !dockerUser) {
+    throw new Error("EXECUTOR_SANDBOX_MODE=docker requires a resolvable process uid and gid");
+  }
+  if (useDocker && dockerPath && dockerImage) {
+    await verifyDockerImageAvailable(dockerPath, dockerImage);
+  }
   const mode: ExecutorSandboxMode = useSeatbelt
     ? "macos-seatbelt"
     : useBubblewrap
       ? "linux-bubblewrap"
-      : "workspace";
+      : useDocker
+        ? "linux-docker"
+        : "workspace";
   const profilePath = useSeatbelt ? join(runtimeDir, `executor-${input.runId}.sb`) : undefined;
   if (profilePath) {
     await writeFile(profilePath, createSeatbeltProfile({
@@ -111,7 +166,8 @@ export async function createExecutorSandbox(input: {
     root: canonicalRoot,
     mode,
     profilePath,
-    backendPath: useSeatbelt ? seatbeltPath : useBubblewrap ? bubblewrapPath : undefined,
+    backendPath: useSeatbelt ? seatbeltPath : useBubblewrap ? bubblewrapPath : useDocker ? dockerPath : undefined,
+    networkMode: dockerNetworkMode,
     allowedReadRoots,
     createTools: () => [
       createReadToolDefinition(canonicalRoot, {
@@ -126,21 +182,46 @@ export async function createExecutorSandbox(input: {
       createBashToolDefinition(canonicalRoot, {
         operations: {
           exec: async (command, _cwd, options) => {
+            const commandEnvironment = sandboxEnvironment(
+              mergeCommandEnvironment(options.env, environment),
+              canonicalRoot
+            );
+            const dockerContainerName = dockerPath && dockerImage && useDocker
+              ? createDockerContainerName(input.runId)
+              : undefined;
             const wrappedCommand = profilePath
               ? `${shellQuote(seatbeltPath!)} -f ${shellQuote(profilePath)} /bin/zsh --emulate sh -f -c ${shellQuote(command)}`
               : bubblewrapPath && useBubblewrap
                 ? renderShellCommand(createBubblewrapCommand({
                     bubblewrapPath,
                     sandboxRoot: canonicalRoot,
-                    readOnlyRoots: allowedReadRoots.filter((candidate) => candidate !== canonicalRoot),
+                    readOnlyRoots,
                     command
                   }))
-                : command;
-            return localBash.exec(wrappedCommand, canonicalRoot, {
-              ...options,
-              timeout: options.timeout ?? executorBashDefaultTimeoutSeconds(),
-              env: sandboxEnvironment(mergeCommandEnvironment(options.env, environment), canonicalRoot)
-            });
+                : dockerPath && dockerImage && useDocker && dockerContainerName && dockerNetworkMode && dockerUser
+                  ? renderShellCommand(createDockerSandboxCommand({
+                      dockerPath,
+                      image: dockerImage,
+                      sandboxRoot: canonicalRoot,
+                      readOnlyRoots,
+                      command,
+                      containerName: dockerContainerName,
+                      networkMode: dockerNetworkMode,
+                      user: dockerUser,
+                      environment: commandEnvironment
+                    }))
+                  : command;
+            try {
+              return await localBash.exec(wrappedCommand, canonicalRoot, {
+                ...options,
+                timeout: options.timeout ?? executorBashDefaultTimeoutSeconds(),
+                env: commandEnvironment
+              });
+            } finally {
+              if (dockerPath && dockerContainerName && useDocker) {
+                await removeDockerContainer(dockerPath, dockerContainerName);
+              }
+            }
           }
         }
       }),
@@ -302,12 +383,186 @@ export function createBubblewrapCommand(input: {
   return argumentsList;
 }
 
+async function verifyBubblewrapUsable(input: {
+  bubblewrapPath: string;
+  sandboxRoot: string;
+  readOnlyRoots: string[];
+}): Promise<void> {
+  const [commandPath, ...argumentsList] = createBubblewrapCommand({
+    bubblewrapPath: input.bubblewrapPath,
+    sandboxRoot: input.sandboxRoot,
+    readOnlyRoots: input.readOnlyRoots,
+    command: "true"
+  });
+  try {
+    await execFileAsync(commandPath, argumentsList, {
+      timeout: SANDBOX_BACKEND_STARTUP_TIMEOUT_MS,
+      maxBuffer: 8 * 1024,
+      windowsHide: true
+    });
+  } catch (error) {
+    throw new Error(
+      `Bubblewrap startup check failed: Linux namespace setup is unavailable (${commandFailureDiagnostic(error)})`
+    );
+  }
+}
+
+/**
+ * Run commands in a non-privileged container when the host cannot create a
+ * user namespace for Bubblewrap. The per-run workspace is writable and
+ * explicitly allowed skill roots are mounted read-only. The Docker socket and
+ * all other host paths remain outside the container.
+ */
+export function createDockerSandboxCommand(input: {
+  dockerPath: string;
+  image: string;
+  sandboxRoot: string;
+  readOnlyRoots?: string[];
+  command: string;
+  containerName: string;
+  networkMode: ExecutorDockerNetworkMode;
+  shellPath?: string;
+  user: string;
+  environment?: NodeJS.ProcessEnv;
+}): string[] {
+  const shellPath = input.shellPath ?? "/bin/bash";
+  const home = join(input.sandboxRoot, "home");
+  const argumentsList = [
+    input.dockerPath,
+    "run",
+    "--rm",
+    "--init",
+    "--pull",
+    "never",
+    "--name",
+    input.containerName,
+    "--network",
+    input.networkMode,
+    "--read-only",
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+    "--pids-limit",
+    "256",
+    "--memory",
+    "1g",
+    "--tmpfs",
+    "/tmp:rw,nosuid,nodev,noexec,size=128m",
+    "--tmpfs",
+    "/run:rw,nosuid,nodev,noexec,size=16m",
+    "--mount",
+    `type=bind,source=${input.sandboxRoot},target=${input.sandboxRoot},bind-propagation=rprivate`,
+    "--workdir",
+    input.sandboxRoot,
+    "--env",
+    `HOME=${home}`,
+    "--env",
+    "TMPDIR=/tmp",
+    "--env",
+    "TMPPREFIX=/tmp/zsh"
+  ];
+  for (const root of dedupeNestedRoots(input.readOnlyRoots ?? [])) {
+    argumentsList.push(
+      "--mount",
+      `type=bind,source=${root},target=${root},readonly,bind-propagation=rprivate`
+    );
+  }
+  for (const name of dockerEnvironmentNames(input.environment)) {
+    argumentsList.push("--env", name);
+  }
+  argumentsList.push("--user", input.user);
+  argumentsList.push(
+    "--entrypoint",
+    shellPath,
+    input.image,
+    "-c",
+    input.command
+  );
+  return argumentsList;
+}
+
+async function verifyDockerImageAvailable(dockerPath: string, image: string): Promise<void> {
+  try {
+    await execFileAsync(dockerPath, ["image", "inspect", "--format", "{{.Id}}", image], {
+      timeout: SANDBOX_BACKEND_STARTUP_TIMEOUT_MS,
+      maxBuffer: 8 * 1024,
+      windowsHide: true
+    });
+  } catch (error) {
+    throw new Error(
+      `Docker sandbox image is unavailable (${commandFailureDiagnostic(error)}); pre-load ${image} before starting the run`
+    );
+  }
+}
+
+async function removeDockerContainer(dockerPath: string, containerName: string): Promise<void> {
+  try {
+    await execFileAsync(dockerPath, ["rm", "--force", containerName], {
+      timeout: SANDBOX_BACKEND_STARTUP_TIMEOUT_MS,
+      maxBuffer: 8 * 1024,
+      windowsHide: true
+    });
+  } catch {
+    // The normal --rm path has already removed the container. Cleanup must
+    // never replace a tool result with a harmless "not found" response.
+  }
+}
+
+function createDockerContainerName(runId: string): string {
+  const normalizedRunId = runId.toLowerCase().replaceAll(/[^a-z0-9_.-]/g, "-").slice(0, 36) || "run";
+  const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  return `luan1ao-${normalizedRunId}-${suffix}`.slice(0, 120);
+}
+
+function dockerEnvironmentNames(environment: NodeJS.ProcessEnv | undefined): string[] {
+  if (!environment) return [];
+  const allowedNames = [
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "PYTHONDONTWRITEBYTECODE"
+  ];
+  return allowedNames.filter((name) => typeof environment[name] === "string");
+}
+
+function currentProcessUser(): string | undefined {
+  if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
+    return undefined;
+  }
+  return `${process.getuid()}:${process.getgid()}`;
+}
+
+function executorDockerNetworkModeFromEnv(): ExecutorDockerNetworkMode {
+  const value = process.env.EXECUTOR_SANDBOX_DOCKER_NETWORK?.trim().toLowerCase() ?? "host";
+  if (value === "host" || value === "bridge" || value === "none") {
+    return value;
+  }
+  throw new Error("EXECUTOR_SANDBOX_DOCKER_NETWORK must be host, bridge, or none");
+}
+
 function executorSandboxModeFromEnv(): ExecutorSandboxRequestedMode {
   const value = process.env.EXECUTOR_SANDBOX_MODE?.trim().toLowerCase();
   if (value === "bwrap" || value === "linux-bubblewrap") {
     return "bubblewrap";
   }
-  if (value === "seatbelt" || value === "bubblewrap" || value === "workspace") {
+  if (value === "linux-docker") {
+    return "docker";
+  }
+  if (value === "seatbelt" || value === "bubblewrap" || value === "docker" || value === "workspace") {
     return value;
   }
   return "auto";
@@ -456,6 +711,16 @@ function isWithin(root: string, candidate: string): boolean {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function commandFailureDiagnostic(error: unknown): string {
+  const candidate = error as { stderr?: unknown; message?: unknown };
+  const detail = typeof candidate.stderr === "string" && candidate.stderr.trim()
+    ? candidate.stderr
+    : typeof candidate.message === "string"
+      ? candidate.message
+      : "unknown backend error";
+  return detail.replaceAll(/\s+/g, " ").trim().slice(0, 500);
 }
 
 function seatbeltString(value: string): string {
