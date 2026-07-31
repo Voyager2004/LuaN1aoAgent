@@ -244,6 +244,53 @@ test("repairs a normally completed response that omitted its terminal submit", a
   assert.deepEqual(toolSets, [["task_result_submit"], ["bash", "task_result_submit"]]);
 });
 
+test("repairs a completed invalid terminal submit with one terminal-only recovery turn", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  const prompts: string[] = [];
+  const toolSets: string[][] = [];
+  let activeTools = ["graph_query", "graph_delta_submit"];
+  const session = {
+    async prompt(text: string): Promise<void> {
+      prompts.push(text);
+      if (prompts.length === 1) {
+        emitToListeners(listeners, {
+          type: "tool_execution_end",
+          toolName: "graph_delta_submit",
+          isError: true,
+          result: { content: [{ type: "text", text: "Validation failed: nodes must be array" }] }
+        });
+        return;
+      }
+      assert.deepEqual(activeTools, ["graph_delta_submit"]);
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName: "graph_delta_submit",
+        isError: false,
+        result: { details: { nodes: [], edges: [] } }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    getActiveToolNames(): string[] {
+      return [...activeTools];
+    },
+    setActiveToolsByName(toolNames: string[]): void {
+      toolSets.push([...toolNames]);
+      activeTools = [...toolNames];
+    }
+  };
+
+  assert.deepEqual(await invokeStructured(session, "test", {
+    toolName: "graph_delta_submit",
+    maxInvalidSubmitSteers: 1
+  }), { nodes: [], edges: [] });
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1] ?? "", /参数未通过校验/);
+  assert.deepEqual(toolSets, [["graph_delta_submit"], ["graph_query", "graph_delta_submit"]]);
+});
+
 test("fails closed when terminal-only recovery cannot restrict the active tools", async () => {
   const listeners: Array<(event: unknown) => void> = [];
   let promptCount = 0;

@@ -51,6 +51,13 @@ export async function invokeStructured<T>(
      * protocol-recovery turn before classifying the invocation as malformed.
      */
     maxMissingSubmitSteers?: number;
+    /**
+     * A terminal tool can also be rejected for a recoverable argument-shape
+     * error.  When omitted, use the same bounded recovery allowance as a
+     * missing terminal submit so existing structured callers get one safe
+     * repair turn without widening their tool surface.
+     */
+    maxInvalidSubmitSteers?: number;
     validate?: (value: unknown) => T;
   }
 ): Promise<T> {
@@ -60,6 +67,7 @@ export async function invokeStructured<T>(
   let lastAssistantStopReason = "";
   let truncationSteersUsed = 0;
   let missingSubmitSteersUsed = 0;
+  let invalidSubmitSteersUsed = 0;
   let terminalOnlyRecoveryActive = false;
   let activeToolsBeforeRecovery: string[] | undefined;
   let restoreActiveTools: ((toolNames: string[]) => void) | undefined;
@@ -75,6 +83,10 @@ export async function invokeStructured<T>(
   const hardTimeoutMs = positiveTimeout(input.hardTimeoutMs ?? input.timeoutMs);
   const maxTruncationSteers = Math.max(0, Math.floor(input.maxTruncationSteers ?? 2));
   const maxMissingSubmitSteers = Math.max(0, Math.floor(input.maxMissingSubmitSteers ?? 0));
+  const maxInvalidSubmitSteers = Math.max(
+    0,
+    Math.floor(input.maxInvalidSubmitSteers ?? input.maxMissingSubmitSteers ?? 0)
+  );
   const rejectOnce = (error: unknown, abortSession = false): void => {
     if (settled) {
       return;
@@ -175,10 +187,12 @@ export async function invokeStructured<T>(
       settled = true;
       resolveInvocation(value);
     } catch (error) {
-      rejectOnce(new StructuredInvocationError(
-        error instanceof Error ? error.message : String(error),
-        "invalid_submit"
-      ));
+      // Preserve the same-session repair opportunity that tool-level
+      // validation errors receive.  A later valid terminal submission from
+      // this prompt still wins; otherwise completion below can issue exactly
+      // one terminal-only recovery turn.
+      terminalToolError = error instanceof Error ? error.message : String(error);
+      resetIdleTimeout();
     }
   });
   resetIdleTimeout();
@@ -193,6 +207,9 @@ export async function invokeStructured<T>(
   const missingSubmitSteerPrompt = `协议恢复：上一响应结束但未调用 ${input.toolName}。`
     + `现在只调用 ${input.toolName} 一次；不要输出正文、不要调用其他工具。`
     + `依据已有上下文提交最小且合法的当前结果。`;
+  const invalidSubmitSteerPrompt = `协议恢复：上一轮 ${input.toolName} 的参数未通过校验。`
+    + `现在只调用 ${input.toolName} 一次；不要输出正文、不要调用其他工具。`
+    + `严格使用当前可见的工具参数结构，依据已有上下文提交最小且合法的当前结果。`;
   let promptCompletion = session.prompt(prompt);
   const handlePromptCompletion = (completion: Promise<void>): void => {
     void completion.then(() => {
@@ -200,6 +217,29 @@ export async function invokeStructured<T>(
         return;
       }
       if (terminalToolError) {
+        if (!providerError
+          && invalidSubmitSteersUsed < maxInvalidSubmitSteers
+          && isRecoverableTerminalSubmitError(terminalToolError)) {
+          // Parameter-shape drift is recoverable without reopening any
+          // ordinary tools.  Clear the previous error so the repair turn can
+          // either submit successfully or report its own terminal outcome.
+          // Unlike a missing submit, preserve the original validation error
+          // when this adapter cannot guarantee a terminal-only recovery turn.
+          if (!getToolSelection(session)) {
+            rejectOnce(new StructuredInvocationError(terminalToolError, "invalid_submit"));
+            return;
+          }
+          if (!enterTerminalOnlyRecovery()) {
+            return;
+          }
+          invalidSubmitSteersUsed += 1;
+          terminalToolError = "";
+          lastAssistantStopReason = "";
+          resetIdleTimeout();
+          promptCompletion = session.prompt(invalidSubmitSteerPrompt);
+          handlePromptCompletion(promptCompletion);
+          return;
+        }
         rejectOnce(new StructuredInvocationError(terminalToolError, "invalid_submit"));
         return;
       }
@@ -275,6 +315,10 @@ export async function invokeStructured<T>(
       }
     }
   }
+}
+
+function isRecoverableTerminalSubmitError(message: string): boolean {
+  return /validation|schema|invalid (?:argument|parameter|submit)|\brequired\b|\bmust\b/i.test(message);
 }
 
 function isSuccessfulAssistantMessage(event: Record<string, unknown>): boolean {

@@ -44,45 +44,41 @@ test("executor exposes bounded public research tools", () => {
 test("projector terminal tool accepts bounded task-shaped drafts for deterministic sanitization", () => {
   const tool = createGraphDeltaSubmitTool();
   const schema = tool.parameters as unknown as {
-    anyOf?: Array<{
-      properties?: {
-        nodes?: {
-          maxItems?: number;
-          items?: {
-            anyOf?: Array<{
-              additionalProperties?: boolean;
-              properties?: {
-                id?: { pattern?: string };
-                graphKind?: { const?: string };
-                properties?: { additionalProperties?: { anyOf?: unknown[] } };
-              };
-            }>;
-          };
-        };
-        edges?: {
-          maxItems?: number;
-          items?: {
+    properties?: {
+      nodes?: {
+        maxItems?: number;
+        items?: {
+          anyOf?: Array<{
             additionalProperties?: boolean;
             properties?: {
-              from?: { pattern?: string };
-              to?: { pattern?: string };
-              type?: { anyOf?: Array<{ const?: string }> };
+              id?: { pattern?: string };
+              graphKind?: { const?: string };
+              properties?: { additionalProperties?: { anyOf?: unknown[] } };
             };
+          }>;
+        };
+      };
+      edges?: {
+        maxItems?: number;
+        items?: {
+          additionalProperties?: boolean;
+          properties?: {
+            from?: { pattern?: string };
+            to?: { pattern?: string };
+            type?: { anyOf?: Array<{ const?: string }> };
           };
         };
-        batches?: { maxItems?: number; items?: unknown };
-        sourceEventIds?: unknown;
       };
-      additionalProperties?: boolean;
-    }>;
+      batches?: unknown;
+      sourceEventIds?: unknown;
+    };
+    additionalProperties?: boolean;
   };
-  const flatSchema = schema.anyOf?.find((branch) => branch.properties?.nodes !== undefined);
-  const batchesSchema = schema.anyOf?.find((branch) => branch.properties?.batches !== undefined);
-  const nodesSchema = flatSchema?.properties?.nodes;
-  const edgesSchema = flatSchema?.properties?.edges;
+  const nodesSchema = schema.properties?.nodes;
+  const edgesSchema = schema.properties?.edges;
 
-  assert.equal(nodesSchema?.maxItems, 12);
-  assert.equal(edgesSchema?.maxItems, 20);
+  assert.equal(nodesSchema?.maxItems, 192);
+  assert.equal(edgesSchema?.maxItems, 320);
   assert.deepEqual(
     nodesSchema?.items?.anyOf?.map((branch) => branch.properties?.graphKind?.const),
     ["reasoning", "operation", "task"]
@@ -101,10 +97,9 @@ test("projector terminal tool accepts bounded task-shaped drafts for determinist
     edgesSchema?.items?.properties?.type?.anyOf?.some((branch) => branch.const === "depends_on"),
     false
   );
-  assert.equal(flatSchema?.properties?.sourceEventIds, undefined);
-  assert.equal(flatSchema?.additionalProperties, false);
-  assert.equal(batchesSchema?.properties?.batches?.maxItems, 16);
-  assert.equal(batchesSchema?.additionalProperties, false);
+  assert.equal(schema.properties?.sourceEventIds, undefined);
+  assert.equal(schema.properties?.batches, undefined);
+  assert.equal(schema.additionalProperties, false);
 });
 
 test("projector terminal tool prepares JSON-serialized node and edge arrays before strict validation", () => {
@@ -155,18 +150,42 @@ test("projector terminal tool repairs a node category implied by its known type 
   assert.equal(Check(tool.parameters, prepared), true);
 });
 
-test("projector terminal tool accepts an explicit empty object as an empty semantic delta", () => {
+test("projector terminal tool leaves an empty object for strict validation and recovery", () => {
   const tool = createGraphDeltaSubmitTool();
   const prepareArguments = tool.prepareArguments;
   assert.ok(prepareArguments);
 
   const prepared = prepareArguments({});
 
-  assert.deepEqual(prepared, { nodes: [], edges: [] });
+  assert.equal(Check(tool.parameters, prepared), false);
+});
+
+test("projector terminal tool fills a missing known category and ignores runtime-owned source refs", () => {
+  const tool = createGraphDeltaSubmitTool();
+  const prepareArguments = tool.prepareArguments;
+  assert.ok(prepareArguments);
+
+  const prepared = prepareArguments({
+    sourceEventIds: ["event:runtime-owned"],
+    nodes: [{
+      id: "new:1",
+      label: "credential observation",
+      type: "Credential",
+      properties: {},
+      evidenceRefs: ["o1"]
+    }],
+    edges: []
+  }) as {
+    nodes: Array<{ graphKind: string }>;
+    sourceEventIds?: unknown;
+  };
+
+  assert.equal(prepared.nodes[0]?.graphKind, "operation");
+  assert.equal("sourceEventIds" in prepared, false);
   assert.equal(Check(tool.parameters, prepared), true);
 });
 
-test("projector terminal tool transports oversized drafts in bounded batches and drops extra edge annotations", () => {
+test("projector terminal tool accepts extended flat drafts and drops extra edge annotations", () => {
   const tool = createGraphDeltaSubmitTool();
   const prepareArguments = tool.prepareArguments;
   assert.ok(prepareArguments);
@@ -187,20 +206,15 @@ test("projector terminal tool transports oversized drafts in bounded batches and
       providerAnnotation: "discard before schema validation"
     }))
   }) as {
-    batches: Array<{
-      nodes: Array<{ id: string; graphKind: string; type: string }>;
-      edges: Array<Record<string, unknown>>;
-    }>;
+    nodes: Array<{ id: string; graphKind: string; type: string }>;
+    edges: Array<Record<string, unknown>>;
   };
 
-  assert.equal(prepared.batches.length, 2);
-  assert.equal(prepared.batches[0]?.nodes.length, 12);
-  assert.equal(prepared.batches[1]?.nodes.length, 2);
-  assert.equal(prepared.batches[0]?.edges.length, 20);
-  assert.equal(prepared.batches[1]?.edges.length, 1);
-  assert.equal(prepared.batches[1]?.nodes[0]?.id, "new:13");
-  assert.equal(prepared.batches[1]?.nodes[0]?.graphKind, "operation");
-  assert.equal("providerAnnotation" in (prepared.batches[0]?.edges[0] ?? {}), false);
+  assert.equal(prepared.nodes.length, 14);
+  assert.equal(prepared.edges.length, 21);
+  assert.equal(prepared.nodes[12]?.id, "new:13");
+  assert.equal(prepared.nodes[12]?.graphKind, "operation");
+  assert.equal("providerAnnotation" in (prepared.edges[0] ?? {}), false);
   assert.equal(Check(tool.parameters, prepared), true);
 });
 
@@ -246,6 +260,7 @@ test("projector terminal tool leaves invalid serialized fields for strict schema
   const nestedString = { nodes: JSON.stringify(["not-a-node"]), edges: "[]" };
   const oversized = { nodes: "[" + " ".repeat(48_001) + "]", edges: "[]" };
   const extraTopLevel = { nodes: "[]", edges: "[]", unexpected: "retain-for-validation" };
+  const wrappedBatches = { batches: JSON.stringify([{ nodes: [], edges: [] }]) };
   const unknownCategory = {
     nodes: JSON.stringify([{
       id: "new:1",
@@ -273,6 +288,7 @@ test("projector terminal tool leaves invalid serialized fields for strict schema
   assert.equal(Check(tool.parameters, prepareArguments(nestedString)), false);
   assert.equal(Check(tool.parameters, prepareArguments(oversized)), false);
   assert.equal(Check(tool.parameters, prepareArguments(extraTopLevel)), false);
+  assert.equal(Check(tool.parameters, prepareArguments(wrappedBatches)), false);
   assert.equal(Check(tool.parameters, prepareArguments(unknownCategory)), false);
   const nestedPrepared = prepareArguments(nestedProperty) as { nodes: Array<{ properties?: Record<string, unknown> }> };
   assert.equal(nestedPrepared.nodes[0]?.properties?.serialized, "[\"leave\",\"as text\"]");

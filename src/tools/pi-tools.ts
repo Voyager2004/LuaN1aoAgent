@@ -188,9 +188,12 @@ const ProjectorGraphEdgeSchema = Type.Object({
   evidenceRefs: Type.Optional(Type.Array(Type.String({ maxLength: 32 }), { maxItems: 8 }))
 }, { additionalProperties: false });
 
-const PROJECTOR_GRAPH_DELTA_MAX_NODES = 12;
-const PROJECTOR_GRAPH_DELTA_MAX_EDGES = 20;
-const PROJECTOR_GRAPH_DELTA_MAX_BATCHES = 16;
+// Keep one flat public tool shape.  The model provider reliably emits this
+// shape, while a root anyOf/batches variant caused it to serialize nested
+// batches as strings.  The prompt still asks for small deltas; these are only
+// hard transport ceilings for a single terminal submission.
+const PROJECTOR_GRAPH_DELTA_MAX_NODES = 192;
+const PROJECTOR_GRAPH_DELTA_MAX_EDGES = 320;
 
 const ProjectorGraphNodeArraySchema = Type.Array(ProjectorGraphNodeSchema, {
   maxItems: PROJECTOR_GRAPH_DELTA_MAX_NODES
@@ -202,15 +205,7 @@ const ProjectorGraphDeltaSchema = Type.Object({
   nodes: ProjectorGraphNodeArraySchema,
   edges: ProjectorGraphEdgeArraySchema
 }, { additionalProperties: false });
-const GraphDeltaSubmitParameters = Type.Union([
-  ProjectorGraphDeltaSchema,
-  Type.Object({
-    batches: Type.Array(ProjectorGraphDeltaSchema, {
-      minItems: 1,
-      maxItems: PROJECTOR_GRAPH_DELTA_MAX_BATCHES
-    })
-  }, { additionalProperties: false })
-]);
+const GraphDeltaSubmitParameters = ProjectorGraphDeltaSchema;
 type GraphDeltaSubmitParams = Static<typeof GraphDeltaSubmitParameters>;
 
 const ProjectorNodeGraphKindByType: Record<string, "reasoning" | "operation" | "task"> = {
@@ -417,32 +412,15 @@ function prepareGraphDeltaSubmitArguments(args: unknown): GraphDeltaSubmitParams
     return args as GraphDeltaSubmitParams;
   }
   const input = args as Record<string, unknown>;
-  // A Projector can legitimately have no semantic change to record.  Some
-  // providers encode that terminal tool call as an empty object rather than
-  // explicitly sending two empty arrays.  Treat only that exact no-op shape as
-  // an empty delta; partial or otherwise malformed drafts remain subject to
-  // the strict schema below.
-  if (Object.keys(input).length === 0) {
-    return { nodes: [], edges: [] };
-  }
-  if (Object.prototype.hasOwnProperty.call(input, "batches")) {
-    return {
-      ...input,
-      batches: normalizeProjectorBatches(input.batches)
-    } as GraphDeltaSubmitParams;
-  }
-  const nodes = normalizeProjectorNodeGraphKinds(decodeSerializedArray(input.nodes));
-  const edges = normalizeProjectorEdgeFields(decodeSerializedArray(input.edges));
-  if (Array.isArray(nodes) && Array.isArray(edges)
-    && (nodes.length > PROJECTOR_GRAPH_DELTA_MAX_NODES || edges.length > PROJECTOR_GRAPH_DELTA_MAX_EDGES)) {
-    const { nodes: _nodes, edges: _edges, ...rest } = input;
-    return {
-      ...rest,
-      batches: partitionProjectorGraphDelta(nodes, edges)
-    } as GraphDeltaSubmitParams;
-  }
+  // sourceEventIds belongs to the runtime-owned GraphDelta, not this public
+  // transport.  Older Projectors can still include it, so discard just this
+  // harmless legacy field while keeping every other unexpected root field
+  // subject to strict validation.
+  const { sourceEventIds: _sourceEventIds, ...transport } = input;
+  const nodes = normalizeProjectorNodeGraphKinds(decodeSerializedArray(transport.nodes));
+  const edges = normalizeProjectorEdgeFields(decodeSerializedArray(transport.edges));
   return {
-    ...input,
+    ...transport,
     nodes,
     edges
   } as GraphDeltaSubmitParams;
@@ -474,8 +452,7 @@ function normalizeProjectorNodeGraphKinds(value: unknown): unknown {
       : undefined;
     const submittedGraphKind = typeof node.graphKind === "string" ? node.graphKind : undefined;
     if (!expectedGraphKind
-      || !submittedGraphKind
-      || !["reasoning", "operation", "task"].includes(submittedGraphKind)
+      || (submittedGraphKind !== undefined && !["reasoning", "operation", "task"].includes(submittedGraphKind))
       || submittedGraphKind === expectedGraphKind) {
       return candidate;
     }
@@ -508,40 +485,6 @@ function normalizeProjectorEdgeFields(value: unknown): unknown {
     }
     return [normalized];
   });
-}
-
-function normalizeProjectorBatches(value: unknown): unknown {
-  if (!Array.isArray(value)) {
-    return value;
-  }
-  return value.map((candidate) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
-      return candidate;
-    }
-    const batch = candidate as Record<string, unknown>;
-    return {
-      ...batch,
-      nodes: normalizeProjectorNodeGraphKinds(decodeSerializedArray(batch.nodes)),
-      edges: normalizeProjectorEdgeFields(decodeSerializedArray(batch.edges))
-    };
-  });
-}
-
-function partitionProjectorGraphDelta(nodes: unknown[], edges: unknown[]): Array<{ nodes: unknown[]; edges: unknown[] }> {
-  const batchCount = Math.max(
-    Math.ceil(nodes.length / PROJECTOR_GRAPH_DELTA_MAX_NODES),
-    Math.ceil(edges.length / PROJECTOR_GRAPH_DELTA_MAX_EDGES)
-  );
-  return Array.from({ length: batchCount }, (_value, index) => ({
-    nodes: nodes.slice(
-      index * PROJECTOR_GRAPH_DELTA_MAX_NODES,
-      (index + 1) * PROJECTOR_GRAPH_DELTA_MAX_NODES
-    ),
-    edges: edges.slice(
-      index * PROJECTOR_GRAPH_DELTA_MAX_EDGES,
-      (index + 1) * PROJECTOR_GRAPH_DELTA_MAX_EDGES
-    )
-  }));
 }
 
 export function createGraphQueryTool(graphStore: SQLiteGraphStore) {

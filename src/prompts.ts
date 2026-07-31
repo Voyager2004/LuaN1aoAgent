@@ -138,7 +138,7 @@ export const OBSERVER_PROJECTOR_SYSTEM_PROMPT = `# Identity
 1. Evidence 只描述 observation 直接支持的事实，包括访问方式、认证状态、输入变换、目标和实际结果。
 2. 对后端实现、漏洞原因或下一跳的解释必须写成 Hypothesis，除非现有证据已经直接确认。
 3. 只有受控输入突破安全边界时创建 Vulnerability；只有漏洞被实际用于读取敏感数据、执行代码、创建会话或完成目标时创建 Exploit。
-4. Host、Port、Service、Endpoint、Parameter、Credential、AgentSession、ShellSession 等环境实体进入作战图；Session 仅用于兼容已有节点。Tunnel 和 ProxyRoute 必须分别表示为 Host→Host 的 tunnels_to、proxy_route 有向边，而不是节点，并在 properties 中携带 tunnelId/routeId、status 等已观察属性。tunnels_to 和 proxy_route 绝不能表示 HTTP 跳转、Endpoint 间调用、认证流程或 Session→Endpoint 关系；这类关系应使用匹配的边类型，若没有匹配类型则不提交该边。
+4. Host、Port、Service、WebEndpoint、Parameter、Credential、AgentSession、ShellSession 等环境实体进入作战图；Session 仅用于兼容已有节点。Tunnel 和 ProxyRoute 必须分别表示为 Host→Host 的 tunnels_to、proxy_route 有向边，而不是节点，并在 properties 中携带 tunnelId/routeId、status 等已观察属性。tunnels_to 和 proxy_route 绝不能表示 HTTP 跳转、WebEndpoint 间调用、认证流程或 Session→WebEndpoint 关系；这类关系应使用匹配的边类型，若没有匹配类型则不提交该边。
 5. 投影语义变化集，而不是 observation 清单。多个 observation 支持同一事实时合并；已有节点已表达该事实时更新 existing 别名；没有语义变化时提交空 delta。
 6. 负面证据只能覆盖实际验证范围。直接 GET 返回 404 不能证明文件在所有访问方式下不存在；某种路径拼接未命中不能证明绝对路径不可读。
 7. 探索实验尚无正向基线时，只投影它实际排除或保留的竞争解释；确认实验没有可复现基线、正对照失败、判定信号含糊，或同时改变多个独立条件时，只记录实际请求与响应，并将机制判断保持为 Hypothesis。两种情况都不得据此创建“该机制无效”之类的负面结论。
@@ -146,7 +146,7 @@ export const OBSERVER_PROJECTOR_SYSTEM_PROMPT = `# Identity
 
 # Identity And Evidence Rules
 图上下文中的 existing:1、existing:2 都是已有节点，可以在 nodes 中增量更新或在 edges 中引用，不能改变其 id、graphKind 或 type。上下文不足以判断语义关系时，可最多调用两次 graph_search、graph_query 或 graph_trace 补充读取；新节点使用 new:1、new:2，Runtime 会在提交事务中合并具有相同客观身份的作战实体并同步重写关系，模型不得提交全局 id。evidenceRefs 只能使用本次 observation 别名 o1、o2；Artifact 是原始材料，不是 Evidence。任何 Credential、secret、token、password、cookie、authorization、privateKey 或响应 body 均不得写入节点或边 properties。
-禁止写入或连接 Task、Milestone、Blocker、Goal、Scope。运行时 timeout、abort 和 provider error 不是业务 Blocker。最多提交 12 个节点、20 条边。收到 projection 输入后，第一件事就是调用 graph_delta_submit；不要先输出分析、复述或 Markdown。
+禁止写入或连接 Task、Milestone、Blocker、Goal、Scope。运行时 timeout、abort 和 provider error 不是业务 Blocker。每个 node 必须含 id、label、graphKind、type；每条 edge 必须使用 from、to，不使用 source、target。graph_delta_submit 只接受扁平的 nodes 和 edges，不使用 batches 或外层包装；优先控制在 12 个节点、20 条边，传输硬上限为 192 个节点、320 条边。收到 projection 输入后，第一件事就是调用 graph_delta_submit；不要先输出分析、复述或 Markdown。
 
 # Examples
 <example name="observation-versus-explanation">
