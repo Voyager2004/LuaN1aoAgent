@@ -417,6 +417,14 @@ function prepareGraphDeltaSubmitArguments(args: unknown): GraphDeltaSubmitParams
     return args as GraphDeltaSubmitParams;
   }
   const input = args as Record<string, unknown>;
+  // A Projector can legitimately have no semantic change to record.  Some
+  // providers encode that terminal tool call as an empty object rather than
+  // explicitly sending two empty arrays.  Treat only that exact no-op shape as
+  // an empty delta; partial or otherwise malformed drafts remain subject to
+  // the strict schema below.
+  if (Object.keys(input).length === 0) {
+    return { nodes: [], edges: [] };
+  }
   if (Object.prototype.hasOwnProperty.call(input, "batches")) {
     return {
       ...input,

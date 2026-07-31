@@ -155,6 +155,17 @@ test("projector terminal tool repairs a node category implied by its known type 
   assert.equal(Check(tool.parameters, prepared), true);
 });
 
+test("projector terminal tool accepts an explicit empty object as an empty semantic delta", () => {
+  const tool = createGraphDeltaSubmitTool();
+  const prepareArguments = tool.prepareArguments;
+  assert.ok(prepareArguments);
+
+  const prepared = prepareArguments({});
+
+  assert.deepEqual(prepared, { nodes: [], edges: [] });
+  assert.equal(Check(tool.parameters, prepared), true);
+});
+
 test("projector terminal tool transports oversized drafts in bounded batches and drops extra edge annotations", () => {
   const tool = createGraphDeltaSubmitTool();
   const prepareArguments = tool.prepareArguments;
